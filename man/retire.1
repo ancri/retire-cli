@@ -1,0 +1,305 @@
+.TH RETIRE 1 "2026-09-01" "retire 1.0.0" "User Commands"
+.SH NAME
+retire \- set paths aside for later deletion, with a ledger and a safety review
+.SH SYNOPSIS
+.B retire
+.I command
+.RI [ options ]
+.br
+.B retire ?
+| \fBretire help\fR [\fIcommand\fR]
+.SH DESCRIPTION
+.B retire
+renames a path aside instead of deleting it, records what was set aside and when, and
+re\-checks it later before anything is removed. It exists so that cleanup is deferred
+and reversible rather than immediate and final.
+.PP
+Nothing in
+.B retire
+deletes anything except
+.BR purge ,
+which requires an explicit
+.B \-\-yes
+and prints what it is about to remove.
+.B review
+is read\-only by design: it reports a verdict and never acts on it.
+.PP
+The move itself is the primary tripwire. Once a path is renamed aside, anything that
+depended on it fails loudly with ENOENT rather than silently reading stale data. The
+checks described under
+.B DETECTION
+are a secondary signal.
+.SH COMMANDS
+.TP
+.BI "put " path " " [ \-\-reason " R" "] [" \-\-review\-in " 90d" ]
+Rename
+.I path
+to
+.IR path .RETIRED. YYYYMMDD
+and record it. The rename is atomic and uses no extra space when the target is on the
+same filesystem.
+.TP
+.BI "adopt " retired_path " " [ \-\-name " N" "] [" \-\-reason " R" "] [" \-\-review\-in " 90d" ]
+Record a path that was already moved aside by hand. The original name is inferred by
+stripping a trailing
+.B .RETIRED.YYYYMMDD
+suffix unless
+.B \-\-name
+is given.
+.TP
+.B list
+Print the ledger: name, status, retirement date, review date, size, reason.
+.TP
+.BR review " [" \-\-notify ]
+Read\-only safety check over every active entry. With
+.BR \-\-notify ,
+sends a desktop notification when, and only when, at least one entry needs attention.
+.TP
+.BI "ack " name
+Accept the current set of references as known and expected, so that
+.B review
+flags only references appearing after this point. Use it to silence historical
+mentions without losing the ability to detect new ones.
+.TP
+.BI "rebaseline " name
+Reset the tripwire snapshot to the tree's current state. Use after deliberately
+touching a retired path, or to upgrade an entry written by an older version.
+.TP
+.BI "restore " name
+Move the path back to its original location and mark the entry restored. Refuses if
+the original path is occupied.
+.TP
+.BI "purge " name " " \-\-yes
+Delete the retired path for real and mark the entry purged. Without
+.BR \-\-yes ,
+prints what it would delete and exits without touching anything.
+.TP
+.B doctor
+Report the detected platform, interpreter, config and state locations, which notifier
+and grep were found, and whether each configured search root exists. Run this first on
+a new machine.
+.SH DETECTION
+.B review
+reports four independent signals.
+.TP
+.B TOUCHED
+The tree's newest
+.IR atime ", " mtime " or " ctime
+is later than the recorded baseline:
+.I atime
+catches reads,
+.I mtime
+catches writes, and
+.I ctime
+catches renames, chmod and chown.
+.TP
+.B DRIFT
+The entry count or total byte count differs from the baseline, which catches files
+added to or deleted from inside the tree.
+.TP
+.B REFERENCED
+A fresh grep of the configured search roots found the retired name in a file that is
+not in the acknowledged set.
+.TP
+.B UNVERIFIED
+The reference check could not run at all: no search root is configured or exists, or
+grep is missing or timed out. Reported rather than silently passing as clean.
+.PP
+An entry is reported as
+.B INVESTIGATE
+if any of those fire,
+.B SAFE TO PURGE
+if the review date has passed cleanly, and
+.B holding
+otherwise.
+.SH CONFIGURATION
+Configuration is optional; every key has a default. The file is JSON at
+.I $XDG_CONFIG_HOME/retire/config.json
+.RI ( ~/.config/retire/config.json
+by default).
+.TP
+.B search_roots
+List of absolute directories to grep for references. Empty by default, which makes
+.B review
+report
+.BR UNVERIFIED .
+Set this to the source trees that could plausibly mention a retired path.
+.TP
+.B includes
+Filename globs to search. Defaults to common source and config extensions.
+.TP
+.B exclude_dirs
+Directory names to skip, such as
+.I .git
+and
+.IR node_modules .
+.TP
+.B atime_slack_hours
+Seconds of grace before a newer
+.I atime
+counts as a read, expressed in hours. Defaults to 36, which suits a
+.B relatime
+mount where a read only updates
+.I atime
+once a day.
+.I mtime
+and
+.I ctime
+are exact and never get slack.
+.TP
+.B default_review_in
+Default review horizon for
+.B put
+and
+.BR adopt .
+Accepts
+.IR Nd ", " Nw ", " Nm " or " Ny .
+.PP
+Example:
+.PP
+.EX
+{
+  "search_roots": ["/home/me/src", "/srv/analysis"],
+  "atime_slack_hours": 36,
+  "default_review_in": "6m"
+}
+.EE
+.SH PLATFORM
+The core \(em ledger, snapshot comparison and every command \(em is portable POSIX
+Python needing only Python 3.7 or newer and no third\-party packages.
+.TP
+.B Linux
+Fully supported. Notifications use
+.BR notify-send (1);
+because cron supplies no session environment,
+.B retire
+fills in
+.B DISPLAY
+and
+.B DBUS_SESSION_BUS_ADDRESS
+itself.
+.TP
+.B macOS
+Fully supported. Notifications use
+.B terminal-notifier
+when installed, otherwise
+.BR osascript .
+Schedule with launchd rather than cron; see
+.I contrib/
+in the source distribution. Note that APFS records access times differently from a
+Linux
+.B relatime
+mount, so the
+.I atime
+signal is less predictable there;
+.IR mtime ", " ctime
+and the count checks are unaffected.
+.TP
+.B Other
+On any platform with no notifier,
+.B review
+still runs and writes its verdict to the log; only the desktop popup is lost. Windows
+is not supported.
+.SH ENVIRONMENT
+.TP
+.B RETIRE_STATE
+Directory holding the ledger and logs. Defaults to
+.IR $XDG_DATA_HOME/retire .
+Set it to exercise
+.B retire
+against a scratch ledger without disturbing the real one.
+.TP
+.B RETIRE_CONFIG
+Path to the config file.
+.TP
+.B RETIRE_SEARCH_ROOTS
+Search roots as a
+.BR os.pathsep -separated
+list, overriding the config file.
+.SH LIMITATIONS
+.TP
+.B No attribution
+The timestamp checks tell you that something touched the tree, never who or which
+process. For attribution, place an audit watch on the path instead:
+.IP
+.EX
+sudo auditctl \-w /path/to/thing.RETIRED.20260101 \-p rwa \-k retire
+sudo ausearch \-k retire
+.EE
+.TP
+.B atime granularity
+On a filesystem mounted
+.BR relatime ,
+a read updates
+.I atime
+at most once per day, hence the default slack. A filesystem mounted
+.B noatime
+will not record reads at all, leaving
+.IR mtime ", " ctime
+and the count checks as the only signals.
+.TP
+.B False positives
+Backup, indexing and antivirus scanners walk the tree and bump
+.IR atime .
+A directory listing counts as a read. This is deliberately conservative.
+.TP
+.B Short names are noisy
+.B REFERENCED
+matches the retired name as a whole word, literally. A short or common name will
+still match unrelated prose. Use
+.B ack
+to accept the current set once you have read it.
+.SH FILES
+.TP
+.I $XDG_DATA_HOME/retire/ledger.jsonl
+One JSON object per entry: paths, dates, size, reason, baseline snapshot,
+acknowledged references, status.
+.TP
+.I $XDG_DATA_HOME/retire/review.log
+Every review verdict, appended.
+.TP
+.I $XDG_CONFIG_HOME/retire/config.json
+Optional configuration.
+.SH EXAMPLES
+Set a directory aside for six months:
+.PP
+.EX
+retire put /srv/old_cache \-\-reason "superseded by parquet" \-\-review\-in 6m
+.EE
+.PP
+Check everything by hand, then silence historical mentions:
+.PP
+.EX
+retire review
+retire ack old_cache
+.EE
+.PP
+Delete once the review comes back clean:
+.PP
+.EX
+retire purge old_cache \-\-yes
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Success. For
+.BR review ,
+no entry needs attention.
+.TP
+.B 1
+An error, or for
+.B review
+at least one entry is
+.B INVESTIGATE
+or
+.BR "SAFE TO PURGE" .
+.TP
+.B 2
+Unknown command.
+.SH SEE ALSO
+.BR auditctl (8),
+.BR ausearch (8),
+.BR notify-send (1),
+.BR crontab (5),
+.BR launchd.plist (5),
+.BR trash-put (1)

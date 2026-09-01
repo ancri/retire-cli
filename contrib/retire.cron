@@ -1,0 +1,6 @@
+# Weekly retire review. Silent unless an entry needs attention.
+# Install with:  crontab -e
+#
+# retire fills in DISPLAY and DBUS_SESSION_BUS_ADDRESS itself, since cron
+# supplies no session environment.
+0 10 * * 1 $HOME/.local/bin/retire review --notify >> $HOME/.local/share/retire/cron.log 2>&1

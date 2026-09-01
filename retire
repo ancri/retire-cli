@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""retire -- set paths aside for later deletion, with a ledger and a safety review.
+
+Nothing here deletes anything except `purge`, which requires an explicit --yes and
+prints what it is about to remove. `review` is read-only by design: it reports a
+verdict and never acts on it.
+
+  retire put <path> [--reason R] [--review-in 90d]   rename aside + record
+  retire adopt <retired_path> [--name N] ...         record an already-moved path
+  retire list                                        show the ledger
+  retire review [--notify]                           read-only safety check
+  retire ack <name>                                  accept current refs as known
+  retire rebaseline <name>                           reset the tripwire snapshot
+  retire restore <name>                              put it back
+  retire purge <name> --yes                          actually delete it
+  retire doctor                                      report the local setup
+
+`retire ?`, `retire help [command]` and `man retire` all show documentation.
+"""
+import argparse, json, os, platform, re, shutil, stat, subprocess, sys, time
+from datetime import date, datetime, timedelta
+
+__version__ = "1.0.0"
+
+HOME = os.path.expanduser("~")
+
+
+def _base(env_var, fallback):
+    """XDG base dir, falling back under $HOME. macOS has no XDG spec but honours these."""
+    return os.environ.get(env_var) or os.path.join(HOME, fallback)
+
+
+STATE  = os.environ.get("RETIRE_STATE") or os.path.join(
+    _base("XDG_DATA_HOME", ".local/share"), "retire")
+CONFIG = os.environ.get("RETIRE_CONFIG") or os.path.join(
+    _base("XDG_CONFIG_HOME", ".config"), "retire", "config.json")
+LEDGER = os.path.join(STATE, "ledger.jsonl")
+LOG    = os.path.join(STATE, "review.log")
+
+DEFAULTS = {
+    # Directories to grep when checking whether a retired name is still referenced.
+    # Empty by default: with no roots the check reports UNVERIFIED rather than
+    # pretending the tree is unreferenced.
+    "search_roots": [],
+    "includes": ["*.py", "*.ipynb", "*.sh", "*.md", "*.yaml", "*.yml", "*.json",
+                 "*.toml", "*.cfg", "*.ini", "*.c", "*.h", "*.go", "*.rs", "*.js",
+                 "*.ts", "*.java", "*.rb", "*.R", "*.r", "*.sql", "*.txt"],
+    "exclude_dirs": [".git", ".hg", ".svn", "__pycache__", "node_modules",
+                     ".ipynb_checkpoints", ".venv", "venv", ".tox", "target"],
+    # A relatime mount only bumps atime once a day, so allow slack before calling a
+    # read real. mtime and ctime are exact and get none.
+    "atime_slack_hours": 36,
+    "default_review_in": "90d",
+}
+
+TS_FIELDS = (("atime", "read"), ("mtime", "contents modified"), ("ctime", "metadata changed"))
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as fh:
+            user = json.load(fh)
+        if not isinstance(user, dict):
+            raise ValueError("config must be a JSON object")
+        cfg.update(user)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        sys.stderr.write("retire: ignoring bad config %s: %s\n" % (CONFIG, exc))
+    env_roots = os.environ.get("RETIRE_SEARCH_ROOTS")
+    if env_roots:
+        cfg["search_roots"] = [p for p in env_roots.split(os.pathsep) if p]
+    return cfg
+
+
+CFG = load_config()
+
+
+# ------------------------------------------------------------------- ledger io
+
+def _load():
+    if not os.path.exists(LEDGER):
+        return []
+    with open(LEDGER) as fh:
+        return [json.loads(ln) for ln in fh if ln.strip()]
+
+
+def _save(entries):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = LEDGER + ".tmp"
+    with open(tmp, "w") as fh:
+        for e in entries:
+            fh.write(json.dumps(e) + "\n")
+    os.replace(tmp, LEDGER)
+
+
+def _log(msg):
+    os.makedirs(STATE, exist_ok=True)
+    with open(LOG, "a") as fh:
+        fh.write("%s  %s\n" % (datetime.now().isoformat(timespec="seconds"), msg))
+
+
+def _find(entries, name):
+    for e in entries:
+        if e["name"] == name and e["status"] == "retired":
+            return e
+    sys.exit("no active entry named %r" % name)
+
+
+def _fmt(ts):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "?"
+
+
+# ------------------------------------------------------------------- tripwire
+
+def _tree_scan(path):
+    """Tripwire snapshot: newest atime/mtime/ctime, entry count, total bytes.
+
+    atime catches reads, mtime catches writes, ctime catches renames/chmod/chown, and
+    the counts catch additions or deletions inside the tree. Symlinks are stat'd with
+    lstat and excluded from the byte total.
+    """
+    snap = {"bytes": 0, "entries": 0, "atime": 0.0, "mtime": 0.0, "ctime": 0.0}
+
+    def absorb(p):
+        try:
+            st = os.lstat(p)
+        except OSError:
+            return
+        snap["entries"] += 1
+        if not stat.S_ISLNK(st.st_mode):
+            snap["bytes"] += st.st_size
+        for f, _ in TS_FIELDS:
+            snap[f] = max(snap[f], getattr(st, "st_" + f))
+
+    absorb(path)
+    for root, dirs, files in os.walk(path, followlinks=False):
+        for nm in files + dirs:
+            absorb(os.path.join(root, nm))
+    return snap
+
+
+def _baseline_of(e):
+    """Baseline snapshot, tolerating entries written by an older version."""
+    if e.get("baseline"):
+        return e["baseline"]
+    if "baseline_atime" in e:
+        return {"atime": e["baseline_atime"]}     # pre-snapshot entry: atime only
+    return {}
+
+
+def _drift(e, path):
+    """Flags describing how the tree changed since its baseline."""
+    base, now, out = _baseline_of(e), _tree_scan(path), []
+    slack_s = float(CFG["atime_slack_hours"]) * 3600
+    for f, label in TS_FIELDS:
+        b = base.get(f)
+        if not b:
+            continue
+        slack = slack_s if f == "atime" else 0
+        if now[f] > b + slack:
+            out.append("TOUCHED: %s at %s (baseline %s)" % (label, _fmt(now[f]), _fmt(b)))
+    for f, label in (("entries", "entry count"), ("bytes", "total bytes")):
+        b = base.get(f)
+        if b is not None and now[f] != b:
+            out.append("DRIFT: %s %s -> %s" % (label, b, now[f]))
+    if not base:
+        out.append("NO BASELINE (entry predates snapshots; run: retire rebaseline %s)" % e["name"])
+    return out
+
+
+# -------------------------------------------------------------- reference scan
+
+def _existing_roots():
+    return [r for r in CFG["search_roots"] if os.path.isdir(r)]
+
+
+def _grep_refs(name, skip_paths):
+    """Files still mentioning `name`, or None if the check could not be run.
+
+    Advisory only -- prose mentions count too.
+    """
+    roots = _existing_roots()
+    if not roots:
+        return None          # grep with no path operands reads stdin and blocks
+    cmd = ["grep", "-rlFw", "--binary-files=without-match"]
+    for inc in CFG["includes"]:
+        cmd.append("--include=" + inc)
+    for ex in CFG["exclude_dirs"]:
+        cmd.append("--exclude-dir=" + ex)
+    cmd.append(name)
+    cmd += roots
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True,
+                             stdin=subprocess.DEVNULL, timeout=180).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    hits = [ln for ln in out.splitlines() if ln.strip()]
+    return [h for h in hits if not any(h.startswith(s) for s in skip_paths)]
+
+
+# -------------------------------------------------------------- notification
+
+def _notify_darwin(title, body):
+    flat = " / ".join(ln.strip() for ln in body.splitlines() if ln.strip())
+    if shutil.which("terminal-notifier"):
+        subprocess.run(["terminal-notifier", "-title", title, "-message", flat], timeout=20)
+        return True
+    if shutil.which("osascript"):
+        def esc(s):
+            return s.replace("\\", "\\\\").replace('"', '\\"')
+        subprocess.run(["osascript", "-e", 'display notification "%s" with title "%s"'
+                        % (esc(flat), esc(title))], timeout=20)
+        return True
+    return False
+
+
+def _notify_linux(title, body, urgency):
+    if not shutil.which("notify-send"):
+        return False
+    env = dict(os.environ)
+    # cron supplies no session environment; guess the usual systemd/X11 values.
+    env.setdefault("DISPLAY", ":0")
+    if hasattr(os, "getuid"):
+        env.setdefault("DBUS_SESSION_BUS_ADDRESS",
+                       "unix:path=/run/user/%d/bus" % os.getuid())
+    subprocess.run(["notify-send", "-u", urgency, "-a", "retire", title, body],
+                   env=env, timeout=20)
+    return True
+
+
+def notify(title, body, urgency="normal"):
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            ok = _notify_darwin(title, body)
+        elif system == "Linux":
+            ok = _notify_linux(title, body, urgency)
+        else:
+            ok = False
+    except Exception as exc:                     # a desktop may simply not be up
+        _log("notification failed: %s" % exc)
+        return False
+    if not ok:
+        _log("no notifier available on %s; verdict written to %s only" % (system, LOG))
+    return ok
+
+
+# ---------------------------------------------------------------- ledger verbs
+
+def _parse_span(s):
+    m = re.fullmatch(r"(\d+)([dwmy])", s.strip().lower())
+    if not m:
+        raise argparse.ArgumentTypeError("use forms like 90d, 12w, 6m, 1y")
+    n, unit = int(m.group(1)), m.group(2)
+    return timedelta(days=n * {"d": 1, "w": 7, "m": 30, "y": 365}[unit])
+
+
+def _record(original_path, retired_path, reason, review_in, name=None):
+    entries = _load()
+    name = name or os.path.basename(original_path)
+    if any(x["name"] == name and x["status"] == "retired" for x in entries):
+        sys.exit("already an active ledger entry named %r" % name)
+    snap = _tree_scan(retired_path)
+    entry = {
+        "name": name,
+        "original_path": original_path,
+        "retired_path": retired_path,
+        "retired_on": date.today().isoformat(),
+        "review_after": (date.today() + review_in).isoformat(),
+        "bytes": snap["bytes"],
+        "reason": reason,
+        "baseline": snap,
+        "acked_refs": [],
+        "status": "retired",
+    }
+    entries.append(entry)
+    _save(entries)
+    return entry
+
+
+def cmd_put(a):
+    src = os.path.abspath(a.path.rstrip(os.sep))
+    if not os.path.exists(src):
+        sys.exit("no such path: %s" % src)
+    dst = "%s.RETIRED.%s" % (src, date.today().strftime("%Y%m%d"))
+    if os.path.exists(dst):
+        sys.exit("target already exists: %s" % dst)
+    try:
+        os.rename(src, dst)                      # same fs -> atomic, no copy
+    except OSError as exc:
+        sys.exit("could not rename %s: %s" % (src, exc))
+    e = _record(src, dst, a.reason, a.review_in)
+    print("retired %s -> %s (%.1f GB, review after %s)"
+          % (src, dst, e["bytes"] / 1e9, e["review_after"]))
+
+
+def cmd_adopt(a):
+    dst = os.path.abspath(a.retired_path.rstrip(os.sep))
+    if not os.path.exists(dst):
+        sys.exit("no such path: %s" % dst)
+    name = a.name or re.sub(r"\.RETIRED\.\d{8}$", "", os.path.basename(dst))
+    original = os.path.join(os.path.dirname(dst), name)
+    e = _record(original, dst, a.reason, a.review_in, name=name)
+    print("adopted %s as %r (%.1f GB, review after %s)"
+          % (dst, name, e["bytes"] / 1e9, e["review_after"]))
+
+
+def cmd_list(a):
+    entries = _load()
+    if not entries:
+        print("ledger is empty")
+        return
+    print("%-22s %-10s %-12s %-12s %8s  %s"
+          % ("NAME", "STATUS", "RETIRED", "REVIEW", "SIZE", "REASON"))
+    for e in entries:
+        print("%-22s %-10s %-12s %-12s %7.1fG  %s"
+              % (e["name"], e["status"], e["retired_on"], e["review_after"],
+                 e["bytes"] / 1e9, e["reason"]))
+
+
+def cmd_review(a):
+    entries = _load()
+    active = [e for e in entries if e["status"] == "retired"]
+    if not active:
+        print("nothing retired")
+        return
+    today, alerts = date.today(), []
+    for e in active:
+        flags, path = [], e["retired_path"]
+        if not os.path.exists(path):
+            flags.append("MISSING (moved or deleted outside this tool)")
+        else:
+            flags += _drift(e, path)
+        found = _grep_refs(e["name"], [path])
+        if found is None:
+            flags.append("UNVERIFIED: reference check could not run "
+                         "(no search_roots configured, or grep unavailable/timed out)")
+        else:
+            refs = [r for r in found if r not in set(e.get("acked_refs", []))]
+            if refs:
+                flags.append("REFERENCED in %d new file(s): %s"
+                             % (len(refs), ", ".join(refs[:3]) + (" ..." if len(refs) > 3 else "")))
+        due = today.isoformat() >= e["review_after"]
+        if due:
+            flags.append("DUE (review date %s passed)" % e["review_after"])
+
+        serious = ("TOUCHED", "DRIFT", "REFERENCED", "MISSING", "NO BASELINE", "UNVERIFIED")
+        if any(f.startswith(serious) for f in flags):
+            verdict = "INVESTIGATE"
+        elif due:
+            verdict = "SAFE TO PURGE"
+        else:
+            verdict = "holding"
+
+        line = "%s [%s] %.1f GB" % (e["name"], verdict, e["bytes"] / 1e9)
+        print(line)
+        for f in flags:
+            print("    - %s" % f)
+        _log(line + ("; " + "; ".join(flags) if flags else ""))
+        if verdict != "holding":
+            alerts.append((e, verdict))
+
+    if a.notify and alerts:
+        body = "\n".join("%s: %s" % (e["name"], v) for e, v in alerts)
+        body += "\n\nrun: retire review   /   retire purge <name> --yes"
+        notify("retire: %d item(s) need attention" % len(alerts), body,
+               urgency="critical" if any(v == "INVESTIGATE" for _, v in alerts) else "normal")
+    return 1 if alerts else 0
+
+
+def cmd_ack(a):
+    entries = _load()
+    e = _find(entries, a.name)
+    refs = _grep_refs(e["name"], [e["retired_path"]])
+    if refs is None:
+        sys.exit("reference check could not run (no search_roots configured); nothing acked")
+    e["acked_refs"] = sorted(set(e.get("acked_refs", [])) | set(refs))
+    _save(entries)
+    print("acknowledged %d reference(s) for %r:" % (len(refs), a.name))
+    for r in e["acked_refs"]:
+        print("    %s" % r)
+    print("review will now flag only references that appear after this point.")
+
+
+def cmd_rebaseline(a):
+    entries = _load()
+    e = _find(entries, a.name)
+    old = _baseline_of(e)
+    e["baseline"] = _tree_scan(e["retired_path"])
+    e["bytes"] = e["baseline"]["bytes"]
+    e.pop("baseline_atime", None)
+    _save(entries)
+    print("rebaselined %r" % a.name)
+    for f, _ in TS_FIELDS:
+        print("    %-6s %s -> %s" % (f, _fmt(old.get(f)), _fmt(e["baseline"][f])))
+    print("    %-6s %s entries, %s bytes"
+          % ("size", e["baseline"]["entries"], e["baseline"]["bytes"]))
+
+
+def cmd_restore(a):
+    entries = _load()
+    e = _find(entries, a.name)
+    if os.path.exists(e["original_path"]):
+        sys.exit("original path is occupied: %s" % e["original_path"])
+    os.rename(e["retired_path"], e["original_path"])
+    e["status"] = "restored"
+    e["restored_on"] = date.today().isoformat()
+    _save(entries)
+    print("restored %s -> %s" % (e["retired_path"], e["original_path"]))
+
+
+def cmd_purge(a):
+    entries = _load()
+    e = _find(entries, a.name)
+    if not a.yes:
+        sys.exit("would delete %s (%.1f GB). Re-run with --yes to confirm."
+                 % (e["retired_path"], e["bytes"] / 1e9))
+    print("deleting %s (%.1f GB) ..." % (e["retired_path"], e["bytes"] / 1e9))
+    shutil.rmtree(e["retired_path"])
+    e["status"] = "purged"
+    e["purged_on"] = date.today().isoformat()
+    _save(entries)
+    _log("PURGED %s" % e["retired_path"])
+    print("done")
+
+
+def cmd_doctor(a):
+    system = platform.system()
+    active = [e for e in _load() if e["status"] == "retired"]
+    print("retire %s" % __version__)
+    print("  platform        %s %s" % (system, platform.release()))
+    print("  python          %s (%s)" % (platform.python_version(), sys.executable))
+    print("  config          %s%s"
+          % (CONFIG, "" if os.path.exists(CONFIG) else "   [absent, using defaults]"))
+    print("  state dir       %s" % STATE)
+    print("  ledger          %s   [%d active]" % (LEDGER, len(active)))
+
+    if system == "Darwin":
+        tool = ("terminal-notifier" if shutil.which("terminal-notifier")
+                else "osascript" if shutil.which("osascript") else None)
+    elif system == "Linux":
+        tool = "notify-send" if shutil.which("notify-send") else None
+    else:
+        tool = None
+    print("  notifier        %s" % (tool or "NONE  [verdicts logged only]"))
+
+    grep = shutil.which("grep")
+    print("  grep            %s" % (grep or "NONE  [reference check disabled]"))
+
+    roots = CFG["search_roots"]
+    if not roots:
+        print("  search roots    none configured  [reference check reports UNVERIFIED]")
+    for r in roots:
+        print("  search root     %s%s" % (r, "" if os.path.isdir(r) else "   [MISSING]"))
+    print("  atime slack     %s h" % CFG["atime_slack_hours"])
+
+
+# ------------------------------------------------------------------------- cli
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="retire", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="full documentation: man retire")
+    ap.add_argument("--version", action="version", version="retire " + __version__)
+    sub = ap.add_subparsers(dest="cmd")
+    P = {}
+    span = _parse_span(DEFAULTS["default_review_in"])
+
+    p = sub.add_parser("put", help="rename a path aside and record it")
+    p.add_argument("path")
+    p.add_argument("--reason", default="")
+    p.add_argument("--review-in", type=_parse_span, default=span)
+    p.set_defaults(func=cmd_put); P["put"] = p
+
+    p = sub.add_parser("adopt", help="record a path that was already moved aside")
+    p.add_argument("retired_path")
+    p.add_argument("--name", default=None)
+    p.add_argument("--reason", default="")
+    p.add_argument("--review-in", type=_parse_span, default=span)
+    p.set_defaults(func=cmd_adopt); P["adopt"] = p
+
+    p = sub.add_parser("list", help="show the ledger")
+    p.set_defaults(func=cmd_list); P["list"] = p
+
+    p = sub.add_parser("review", help="read-only safety check")
+    p.add_argument("--notify", action="store_true")
+    p.set_defaults(func=cmd_review); P["review"] = p
+
+    p = sub.add_parser("ack", help="accept current references as known")
+    p.add_argument("name"); p.set_defaults(func=cmd_ack); P["ack"] = p
+
+    p = sub.add_parser("rebaseline", help="reset the tripwire snapshot")
+    p.add_argument("name"); p.set_defaults(func=cmd_rebaseline); P["rebaseline"] = p
+
+    p = sub.add_parser("restore", help="move it back")
+    p.add_argument("name"); p.set_defaults(func=cmd_restore); P["restore"] = p
+
+    p = sub.add_parser("purge", help="actually delete it")
+    p.add_argument("name"); p.add_argument("--yes", action="store_true")
+    p.set_defaults(func=cmd_purge); P["purge"] = p
+
+    p = sub.add_parser("doctor", help="report the local setup")
+    p.set_defaults(func=cmd_doctor); P["doctor"] = p
+
+    return ap, P
+
+
+def main():
+    ap, parsers = build_parser()
+    argv = sys.argv[1:]
+
+    # `retire`, `retire ?`, `retire help [cmd]` -> documentation rather than an error.
+    if not argv or argv[0] in ("?", "help", "h", "-h", "--help"):
+        topic = argv[1] if len(argv) > 1 else None
+        (parsers[topic] if topic in parsers else ap).print_help()
+        return 0
+    if not argv[0].startswith("-") and argv[0] not in parsers:
+        sys.stderr.write("retire: unknown command %r\n\n" % argv[0])
+        ap.print_help()
+        return 2
+
+    a = ap.parse_args(argv)
+    return a.func(a) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

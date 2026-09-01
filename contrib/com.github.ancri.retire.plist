@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Weekly retire review on macOS. cron still exists but is deprecated and gated
+  behind Full Disk Access; launchd is the supported path.
+
+    cp contrib/com.github.ancri.retire.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.github.ancri.retire.plist
+
+  Replace USERNAME below, or run:
+    sed -i '' "s/USERNAME/$USER/g" ~/Library/LaunchAgents/com.github.ancri.retire.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.github.ancri.retire</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/USERNAME/.local/bin/retire</string>
+        <string>review</string>
+        <string>--notify</string>
+    </array>
+
+    <!-- Mondays at 10:00 local time. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key><integer>1</integer>
+        <key>Hour</key><integer>10</integer>
+        <key>Minute</key><integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/USERNAME/.local/share/retire/cron.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/USERNAME/.local/share/retire/cron.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
