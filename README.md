@@ -24,7 +24,8 @@ old_cache [INVESTIGATE] 2.5 GB
 ```
 
 **Nothing here deletes anything except `purge`, which requires an explicit `--yes`.**
-`review` is read-only by design: it reports a verdict and never acts on it.
+`review` never modifies, moves or deletes a retired path and never acts on its own
+verdict; it writes only to its own ledger.
 
 ## Why the move is the point
 
@@ -87,12 +88,25 @@ Full reference: `man retire`.
 | Signal | Catches |
 |---|---|
 | `TOUCHED` | Newer `atime` (reads), `mtime` (writes), or `ctime` (rename, chmod, chown) |
+| `EARLIER` | A hit from a previous review, remembered until you `rebaseline` |
 | `DRIFT` | Entry count or byte count changed — files added or deleted inside |
 | `REFERENCED` | The name still appears in your configured source roots |
 | `UNVERIFIED` | The reference check could not run — reported, never passed off as clean |
 
 An entry is `INVESTIGATE` if any of those fire, `SAFE TO PURGE` once the review date
 passes cleanly, and `holding` otherwise.
+
+### The observer problem
+
+Walking a tree calls `readdir` on every directory, which updates that directory's
+`atime`. A naive implementation reports its own traversal as an external read on every
+run — which is exactly what `retire` 1.0.0 did.
+
+So `review` records when its walk finished and measures reads from there. The `atime`
+signal answers *"has anything read this since the last review?"*, not *"since
+retirement"*. `mtime`, `ctime` and the counts are unaffected — reading a directory does
+not change them. Because that floor moves forward, hits are recorded in the ledger and
+re-reported as `EARLIER` until `rebaseline` clears them.
 
 **It cannot tell you *who* touched something.** Timestamps carry no attribution. If you
 need that, put an audit watch on the path instead:

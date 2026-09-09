@@ -1,4 +1,4 @@
-.TH RETIRE 1 "2026-09-01" "retire 1.0.0" "User Commands"
+.TH RETIRE 1 "2026-09-09" "retire 1.1.0" "User Commands"
 .SH NAME
 retire \- set paths aside for later deletion, with a ledger and a safety review
 .SH SYNOPSIS
@@ -22,7 +22,12 @@ which requires an explicit
 .B \-\-yes
 and prints what it is about to remove.
 .B review
-is read\-only by design: it reports a verdict and never acts on it.
+never modifies, moves or deletes a retired path, and never acts on its own verdict. It
+does write to its own ledger: the
+.I atime
+floor described under
+.B DETECTION
+and any tripwire hits it needs to remember.
 .PP
 The move itself is the primary tripwire. Once a path is renamed aside, anything that
 depended on it fails loudly with ENOENT rather than silently reading stale data. The
@@ -92,6 +97,28 @@ catches reads,
 catches writes, and
 .I ctime
 catches renames, chmod and chown.
+.IP
+Walking a tree calls
+.BR readdir (3)
+on every directory, which updates that directory's own
+.IR atime .
+.B review
+therefore records when its walk finished and measures reads from that point, not from
+retirement: the
+.I atime
+signal answers \(lqhas anything read this since the last review?\(rq. Without that
+floor the check reports its own traversal as an external read on every run.
+.I mtime
+and
+.I ctime
+are unaffected \(em reading a directory does not change them.
+.IP
+Because the floor moves forward, a genuine hit would otherwise be visible in exactly
+one review and then vanish, so hits are recorded in the ledger and re-reported as
+.B EARLIER
+until
+.B rebaseline
+clears them.
 .TP
 .B DRIFT
 The entry count or total byte count differs from the baseline, which catches files

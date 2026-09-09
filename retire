@@ -20,7 +20,7 @@ verdict and never acts on it.
 import argparse, json, os, platform, re, shutil, stat, subprocess, sys, time
 from datetime import date, datetime, timedelta
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 HOME = os.path.expanduser("~")
 
@@ -121,7 +121,8 @@ def _tree_scan(path):
     the counts catch additions or deletions inside the tree. Symlinks are stat'd with
     lstat and excluded from the byte total.
     """
-    snap = {"bytes": 0, "entries": 0, "atime": 0.0, "mtime": 0.0, "ctime": 0.0}
+    snap = {"bytes": 0, "entries": 0, "atime": 0.0, "mtime": 0.0, "ctime": 0.0,
+            "scanned_at": 0.0}
 
     def absorb(p):
         try:
@@ -138,6 +139,10 @@ def _tree_scan(path):
     for root, dirs, files in os.walk(path, followlinks=False):
         for nm in files + dirs:
             absorb(os.path.join(root, nm))
+    # Walking a tree calls readdir on every directory, which updates that
+    # directory's atime. Our own scan is therefore indistinguishable from an
+    # external read unless we remember when we did it -- see _drift().
+    snap["scanned_at"] = time.time()
     return snap
 
 
@@ -151,23 +156,30 @@ def _baseline_of(e):
 
 
 def _drift(e, path):
-    """Flags describing how the tree changed since its baseline."""
+    """(flags, snapshot) describing how the tree changed since its baseline.
+
+    The atime floor is the later of the recorded baseline and the end of our own
+    previous walk, because that walk bumped every directory's atime itself. Without
+    this, review reports its own traversal as an external read.
+    """
     base, now, out = _baseline_of(e), _tree_scan(path), []
     slack_s = float(CFG["atime_slack_hours"]) * 3600
     for f, label in TS_FIELDS:
         b = base.get(f)
+        if f == "atime":
+            b = max(b or 0, base.get("scanned_at") or 0)
         if not b:
             continue
         slack = slack_s if f == "atime" else 0
         if now[f] > b + slack:
-            out.append("TOUCHED: %s at %s (baseline %s)" % (label, _fmt(now[f]), _fmt(b)))
+            out.append("TOUCHED: %s at %s (last checked %s)" % (label, _fmt(now[f]), _fmt(b)))
     for f, label in (("entries", "entry count"), ("bytes", "total bytes")):
         b = base.get(f)
         if b is not None and now[f] != b:
             out.append("DRIFT: %s %s -> %s" % (label, b, now[f]))
     if not base:
         out.append("NO BASELINE (entry predates snapshots; run: retire rebaseline %s)" % e["name"])
-    return out
+    return out, now
 
 
 # -------------------------------------------------------------- reference scan
@@ -328,11 +340,12 @@ def cmd_review(a):
         return
     today, alerts = date.today(), []
     for e in active:
-        flags, path = [], e["retired_path"]
+        flags, path, snap = [], e["retired_path"], None
         if not os.path.exists(path):
             flags.append("MISSING (moved or deleted outside this tool)")
         else:
-            flags += _drift(e, path)
+            found_flags, snap = _drift(e, path)
+            flags += found_flags
         found = _grep_refs(e["name"], [path])
         if found is None:
             flags.append("UNVERIFIED: reference check could not run "
@@ -346,8 +359,24 @@ def cmd_review(a):
         if due:
             flags.append("DUE (review date %s passed)" % e["review_after"])
 
+        # A tripwire hit is recorded, because rolling the atime floor forward (below)
+        # would otherwise make a real touch visible in exactly one review and then
+        # vanish. Cleared by rebaseline.
+        remembered = e.setdefault("events", [])
+        known = set(x["flag"] for x in remembered)
+        for f in flags:
+            if f.startswith(("TOUCHED", "DRIFT")) and f not in known:
+                remembered.append({"seen": today.isoformat(), "flag": f})
+                known.add(f)
+        earlier = [x for x in remembered if x["flag"] not in flags]
+
+        # Our own walk bumped every directory's atime; move the floor past it so the
+        # next review measures reads since this check, not since retirement.
+        if snap is not None and isinstance(e.get("baseline"), dict):
+            e["baseline"]["scanned_at"] = snap["scanned_at"]
+
         serious = ("TOUCHED", "DRIFT", "REFERENCED", "MISSING", "NO BASELINE", "UNVERIFIED")
-        if any(f.startswith(serious) for f in flags):
+        if any(f.startswith(serious) for f in flags) or earlier:
             verdict = "INVESTIGATE"
         elif due:
             verdict = "SAFE TO PURGE"
@@ -358,9 +387,13 @@ def cmd_review(a):
         print(line)
         for f in flags:
             print("    - %s" % f)
+        for x in earlier:
+            print("    - EARLIER (%s): %s" % (x["seen"], x["flag"]))
         _log(line + ("; " + "; ".join(flags) if flags else ""))
         if verdict != "holding":
             alerts.append((e, verdict))
+
+    _save(entries)          # bookkeeping only: atime floor + remembered hits
 
     if a.notify and alerts:
         body = "\n".join("%s: %s" % (e["name"], v) for e, v in alerts)
@@ -391,8 +424,10 @@ def cmd_rebaseline(a):
     e["baseline"] = _tree_scan(e["retired_path"])
     e["bytes"] = e["baseline"]["bytes"]
     e.pop("baseline_atime", None)
+    cleared = len(e.get("events", []))
+    e["events"] = []
     _save(entries)
-    print("rebaselined %r" % a.name)
+    print("rebaselined %r%s" % (a.name, " (cleared %d remembered hit(s))" % cleared if cleared else ""))
     for f, _ in TS_FIELDS:
         print("    %-6s %s -> %s" % (f, _fmt(old.get(f)), _fmt(e["baseline"][f])))
     print("    %-6s %s entries, %s bytes"

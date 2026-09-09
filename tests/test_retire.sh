@@ -68,6 +68,22 @@ else
   printf '  skip touch -a unsupported here\n'
 fi
 
+# --- review must not trip over its own traversal -----------------------------
+# os.walk calls readdir on every directory, which updates that directory's atime.
+# Without an explicit floor, review reports its own scan as an external read.
+# Age every entry, files included: a freshly created file's atime would otherwise
+# dominate the tree max and mask the effect entirely.
+if find "$R" -exec touch -a -d '3 days ago' {} + 2>/dev/null; then
+  "$RETIRE" rebaseline tree >/dev/null              # this walk bumps dir atimes
+  out=$("$RETIRE" review 2>&1 || true)
+  if printf '%s' "$out" | grep -q "TOUCHED: read"; then
+    bad "review reported its own walk as a read"; printf '%s\n' "$out"
+  else ok "review does not report its own walk"; fi
+  check "and stays quiet on a repeat run" "holding" "$("$RETIRE" review 2>&1 || true)"
+else
+  printf '  skip  touch -a unsupported here\n'
+fi
+
 # --- detection: references --------------------------------------------------
 echo "this mentions tree by name" > "$TMP/roots/code.py"
 check "new reference is flagged" "REFERENCED" "$("$RETIRE" review 2>&1 || true)"
