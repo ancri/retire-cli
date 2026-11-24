@@ -453,7 +453,10 @@ def cmd_purge(a):
         sys.exit("would delete %s (%.1f GB). Re-run with --yes to confirm."
                  % (e["retired_path"], e["bytes"] / 1e9))
     print("deleting %s (%.1f GB) ..." % (e["retired_path"], e["bytes"] / 1e9))
-    shutil.rmtree(e["retired_path"])
+    if os.path.isdir(e["retired_path"]) and not os.path.islink(e["retired_path"]):
+        shutil.rmtree(e["retired_path"])
+    else:
+        os.remove(e["retired_path"])             # put also accepts single files
     e["status"] = "purged"
     e["purged_on"] = date.today().isoformat()
     _save(entries)

@@ -104,5 +104,15 @@ out=$("$RETIRE" purge tree 2>&1) && bad "purge without --yes should exit non-zer
 [ -d "$TMP/tree" ] && ok "restore put it back" || bad "restore failed"
 check "restored entry shows in list" "restored" "$("$RETIRE" list 2>&1)"
 
+# --- purge ------------------------------------------------------------------
+"$RETIRE" put "$TMP/tree" --reason test >/dev/null
+"$RETIRE" purge tree --yes >/dev/null && ok "purge --yes deletes a directory" || bad "purge failed on a directory"
+[ ! -e "$R" ] && ok "retired directory is gone" || bad "retired directory still exists"
+echo ccc > "$TMP/one.pkl"
+"$RETIRE" put "$TMP/one.pkl" --reason test >/dev/null
+"$RETIRE" purge one.pkl --yes >/dev/null && ok "purge --yes deletes a single file" || bad "purge failed on a single file"
+[ -z "$(ls "$TMP" | grep '^one\.pkl')" ] && ok "retired file is gone" || bad "retired file still exists"
+check "purged entries show in list" "purged" "$("$RETIRE" list 2>&1)"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
