@@ -43,6 +43,16 @@ R=$(ls -d "$TMP"/tree.RETIRED.* 2>/dev/null || true)
 check "list shows the entry" "tree" "$("$RETIRE" list 2>&1)"
 check "clean review holds"   "holding" "$("$RETIRE" review 2>&1)"
 
+# --- put must refuse a duplicate name before it moves anything ---------------
+# Entries are named after the basename, so a second directory called "tree" collides.
+# The refusal has to come before the rename: an unrecorded rename is a lost path.
+mkdir -p "$TMP/other/tree"
+out=$("$RETIRE" put "$TMP/other/tree" --reason dup 2>&1) && bad "duplicate name should exit non-zero" \
+                                                          || check "duplicate name is refused" "already an active ledger entry" "$out"
+[ -d "$TMP/other/tree" ] && ok "refused path is left in place" || bad "refused path was moved"
+[ -z "$(ls "$TMP/other" | grep RETIRED)" ] && ok "no unrecorded .RETIRED left behind" \
+                                            || bad "duplicate put left an unrecorded rename"
+
 # --- detection: write -------------------------------------------------------
 echo more >> "$R/one.txt"
 out=$("$RETIRE" review 2>&1 || true)
@@ -113,6 +123,20 @@ echo ccc > "$TMP/one.pkl"
 "$RETIRE" purge one.pkl --yes >/dev/null && ok "purge --yes deletes a single file" || bad "purge failed on a single file"
 [ -z "$(ls "$TMP" | grep '^one\.pkl')" ] && ok "retired file is gone" || bad "retired file still exists"
 check "purged entries show in list" "purged" "$("$RETIRE" list 2>&1)"
+
+# --- put rolls the rename back when the ledger cannot be written --------------
+# Root ignores directory permissions, so this check only means something for a normal user.
+if [ "$(id -u)" -ne 0 ]; then
+  mkdir -p "$TMP/rollme"
+  chmod 555 "$RETIRE_STATE"
+  out=$("$RETIRE" put "$TMP/rollme" --reason test 2>&1) && bad "put with an unwritable ledger should exit non-zero" \
+                                                        || check "unwritable ledger is reported" "could not record" "$out"
+  chmod 755 "$RETIRE_STATE"
+  [ -d "$TMP/rollme" ] && ok "rename was rolled back" || bad "path left renamed without a ledger entry"
+  [ -z "$(ls "$TMP" | grep '^rollme\.RETIRED')" ] && ok "no .RETIRED copy remains" || bad ".RETIRED copy remains"
+else
+  printf '  skip  running as root: directory permissions are not enforced\n'
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

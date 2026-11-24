@@ -1,4 +1,4 @@
-.TH RETIRE 1 "2026-09-09" "retire 1.1.0" "User Commands"
+.TH RETIRE 1 "2026-11-24" "retire 1.1.1" "User Commands"
 .SH NAME
 retire \- set paths aside for later deletion, with a ledger and a safety review
 .SH SYNOPSIS
@@ -42,7 +42,10 @@ Rename
 to
 .IR path .RETIRED. YYYYMMDD
 and record it. The rename is atomic and uses no extra space when the target is on the
-same filesystem.
+same filesystem. The entry is named after the basename of
+.IR path ;
+if an active entry already has that name, put refuses without moving anything. If the
+ledger cannot be written after the rename, put moves the path back.
 .TP
 .BI "adopt " retired_path " " [ \-\-name " N" "] [" \-\-reason " R" "] [" \-\-review\-in " 90d" ]
 Record a path that was already moved aside by hand. The original name is inferred by

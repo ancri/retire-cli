@@ -174,6 +174,9 @@ signal is less predictable. `mtime`, `ctime` and the count checks are unaffected
 - **`noatime` mounts record no reads at all**, leaving `mtime`, `ctime` and the counts.
 - **Cross-filesystem moves are not atomic.** `put` uses `os.rename`, which fails across
   filesystems rather than silently copying 2 GB.
+- **Names are basenames.** An entry is named after the last component of its path, and
+  two active entries cannot share a name: `put` refuses a second `cache` before moving
+  anything. Move such directories into one uniquely named directory and retire that.
 
 ## Tests
 

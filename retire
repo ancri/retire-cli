@@ -20,7 +20,7 @@ verdict and never acts on it.
 import argparse, json, os, platform, re, shutil, stat, subprocess, sys, time
 from datetime import date, datetime, timedelta
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 HOME = os.path.expanduser("~")
 
@@ -269,10 +269,14 @@ def _parse_span(s):
     return timedelta(days=n * {"d": 1, "w": 7, "m": 30, "y": 365}[unit])
 
 
+def _name_taken(entries, name):
+    return any(x["name"] == name and x["status"] == "retired" for x in entries)
+
+
 def _record(original_path, retired_path, reason, review_in, name=None):
     entries = _load()
     name = name or os.path.basename(original_path)
-    if any(x["name"] == name and x["status"] == "retired" for x in entries):
+    if _name_taken(entries, name):
         sys.exit("already an active ledger entry named %r" % name)
     snap = _tree_scan(retired_path)
     entry = {
@@ -296,6 +300,11 @@ def cmd_put(a):
     src = os.path.abspath(a.path.rstrip(os.sep))
     if not os.path.exists(src):
         sys.exit("no such path: %s" % src)
+    # Entries are named after the basename. Refuse a taken name before anything moves:
+    # checking only inside _record, after the rename, left the path renamed but unrecorded.
+    if _name_taken(_load(), os.path.basename(src)):
+        sys.exit("already an active ledger entry named %r; nothing was moved"
+                 % os.path.basename(src))
     dst = "%s.RETIRED.%s" % (src, date.today().strftime("%Y%m%d"))
     if os.path.exists(dst):
         sys.exit("target already exists: %s" % dst)
@@ -303,7 +312,19 @@ def cmd_put(a):
         os.rename(src, dst)                      # same fs -> atomic, no copy
     except OSError as exc:
         sys.exit("could not rename %s: %s" % (src, exc))
-    e = _record(src, dst, a.reason, a.review_in)
+    try:
+        e = _record(src, dst, a.reason, a.review_in)
+    except BaseException as exc:
+        # Any failure to record (ledger unwritable, a racing put, Ctrl-C during the scan)
+        # must not leave a rename the ledger does not know about: move it back first.
+        try:
+            os.rename(dst, src)
+        except OSError as back:
+            sys.exit("could not record %s (%s) and could not move it back (%s); it is at %s"
+                     % (src, exc, back, dst))
+        if isinstance(exc, OSError):
+            sys.exit("could not record %s: %s; moved it back, nothing changed" % (src, exc))
+        raise
     print("retired %s -> %s (%.1f GB, review after %s)"
           % (src, dst, e["bytes"] / 1e9, e["review_after"]))
 
