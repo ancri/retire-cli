@@ -19,8 +19,9 @@ verdict and never acts on it.
 """
 import argparse, json, os, platform, re, shutil, stat, subprocess, sys, time
 from datetime import date, datetime, timedelta
+from fnmatch import fnmatchcase
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 HOME = os.path.expanduser("~")
 
@@ -119,7 +120,7 @@ def _tree_scan(path):
 
     atime catches reads, mtime catches writes, ctime catches renames/chmod/chown, and
     the counts catch additions or deletions inside the tree. Symlinks are stat'd with
-    lstat and excluded from the byte total.
+    lstat, never followed, and excluded from the byte total.
     """
     snap = {"bytes": 0, "entries": 0, "atime": 0.0, "mtime": 0.0, "ctime": 0.0,
             "scanned_at": 0.0}
@@ -128,20 +129,38 @@ def _tree_scan(path):
         try:
             st = os.lstat(p)
         except OSError:
-            return
+            return None
         snap["entries"] += 1
         if not stat.S_ISLNK(st.st_mode):
             snap["bytes"] += st.st_size
         for f, _ in TS_FIELDS:
             snap[f] = max(snap[f], getattr(st, "st_" + f))
+        return st
 
-    absorb(path)
-    for root, dirs, files in os.walk(path, followlinks=False):
-        for nm in files + dirs:
-            absorb(os.path.join(root, nm))
-    # Walking a tree calls readdir on every directory, which updates that
-    # directory's atime. Our own scan is therefore indistinguishable from an
-    # external read unless we remember when we did it -- see _drift().
+    # Never follow a symlink: resolving one updates the link's own atime, which
+    # absorb() would then read back as an external read. os.walk() cannot be used
+    # here, because it resolves links to classify them even with followlinks=False.
+    # Each directory is absorbed before it is listed, so the listing's own atime
+    # update is not seen either.
+    top = absorb(path)
+    stack = [path] if top is not None and stat.S_ISDIR(top.st_mode) else []
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                children = list(it)
+        except OSError:
+            continue
+        for ent in children:
+            absorb(ent.path)
+            try:
+                if ent.is_dir(follow_symlinks=False):
+                    stack.append(ent.path)
+            except OSError:
+                pass
+    # Listing a directory updates its atime. Our own scan is therefore
+    # indistinguishable from an external read unless we remember when we did it --
+    # see _drift().
     snap["scanned_at"] = time.time()
     return snap
 
@@ -188,28 +207,111 @@ def _existing_roots():
     return [r for r in CFG["search_roots"] if os.path.isdir(r)]
 
 
-def _grep_refs(name, skip_paths):
-    """Files still mentioning `name`, or None if the check could not be run.
+def _real(p):
+    """p with the symlinks in its parent resolved, but not p itself."""
+    p = os.path.abspath(p)
+    return os.path.join(os.path.realpath(os.path.dirname(p)), os.path.basename(p))
 
-    Advisory only -- prose mentions count too.
+
+def _grep_operands(skip_paths):
+    """Paths for grep that cover every search root except skip_paths, or None if no root exists.
+
+    grep must not enter a retired path: listing its directories and reading its files
+    updates their atimes, which review then reports as reads. grep's --exclude-dir
+    matches base names, so it would also skip any live directory that happens to share
+    a retired path's name. Instead, the directories on the way down to a skipped path
+    are listed here and their other children are handed to grep one by one, filtered
+    as grep -r filters what it finds: symlinks are not followed, exclude_dirs are
+    skipped and files must match includes. Nothing inside a skipped path is opened.
     """
     roots = _existing_roots()
     if not roots:
-        return None          # grep with no path operands reads stdin and blocks
+        return None
+    skip = set(_real(p) for p in skip_paths)
+    above = set()                       # real directories that hold a skipped path
+    for p in skip:
+        d = os.path.dirname(p)
+        while d not in above:
+            above.add(d)
+            d = os.path.dirname(d)
+
+    def matches(name, globs):
+        return any(fnmatchcase(name, g) for g in globs)
+
+    ops = []
+
+    def expand(shown, real):
+        try:
+            with os.scandir(shown) as it:
+                children = list(it)
+        except OSError:
+            return
+        for ent in children:
+            child = os.path.join(real, ent.name)
+            try:
+                if child in skip or ent.is_symlink():
+                    continue
+                if ent.is_dir(follow_symlinks=False):
+                    if matches(ent.name, CFG["exclude_dirs"]):
+                        continue
+                    if child in above:
+                        expand(ent.path, child)
+                    else:
+                        ops.append(ent.path)
+                elif ent.is_file(follow_symlinks=False):
+                    if not CFG["includes"] or matches(ent.name, CFG["includes"]):
+                        ops.append(ent.path)
+            except OSError:
+                continue
+
+    for root in roots:
+        real = os.path.realpath(root)
+        if any(real == s or real.startswith(s + os.sep) for s in skip):
+            continue
+        if real in above:
+            expand(root, real)
+        else:
+            ops.append(root)
+    return ops
+
+
+def _batches(paths, limit=64 * 1024):
+    """Split grep operands so that each command line stays far below ARG_MAX."""
+    batch, size = [], 0
+    for p in paths:
+        n = len(os.fsencode(p)) + 1
+        if batch and size + n > limit:
+            yield batch
+            batch, size = [], 0
+        batch.append(p)
+        size += n
+    if batch:
+        yield batch
+
+
+def _grep_refs(name, operands):
+    """Files still mentioning `name`, or None if the check could not be run.
+
+    `operands` comes from _grep_operands(). Advisory only -- prose mentions count too.
+    """
+    if operands is None:
+        return None          # no search root: grep with no path operands reads stdin
     cmd = ["grep", "-rlFw", "--binary-files=without-match"]
     for inc in CFG["includes"]:
         cmd.append("--include=" + inc)
     for ex in CFG["exclude_dirs"]:
         cmd.append("--exclude-dir=" + ex)
-    cmd.append(name)
-    cmd += roots
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True,
-                             stdin=subprocess.DEVNULL, timeout=180).stdout
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    hits = [ln for ln in out.splitlines() if ln.strip()]
-    return [h for h in hits if not any(h.startswith(s) for s in skip_paths)]
+    cmd += ["-e", name, "--"]
+    hits, deadline = [], time.time() + 180
+    for batch in _batches(operands):
+        try:
+            out = subprocess.run(cmd + batch, capture_output=True, text=True,
+                                 stdin=subprocess.DEVNULL,
+                                 timeout=max(1.0, deadline - time.time())).stdout
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        hits += [ln for ln in out.splitlines() if ln.strip()]
+    return hits
 
 
 # -------------------------------------------------------------- notification
@@ -360,14 +462,22 @@ def cmd_review(a):
         print("nothing retired")
         return
     today, alerts = date.today(), []
+
+    # Scan every tree before running any reference check. grep reads directories and
+    # files under the search roots, so a tree scanned after a grep could see that grep
+    # as a read; _grep_operands() also keeps grep out of every retired path. lexists,
+    # because exists() would resolve a retired symlink and update its atime.
+    scans = []
     for e in active:
-        flags, path, snap = [], e["retired_path"], None
-        if not os.path.exists(path):
-            flags.append("MISSING (moved or deleted outside this tool)")
+        if os.path.lexists(e["retired_path"]):
+            scans.append(_drift(e, e["retired_path"]))
         else:
-            found_flags, snap = _drift(e, path)
-            flags += found_flags
-        found = _grep_refs(e["name"], [path])
+            scans.append((["MISSING (moved or deleted outside this tool)"], None))
+    operands = _grep_operands([e["retired_path"] for e in active])
+
+    for e, (tripped, snap) in zip(active, scans):
+        flags = list(tripped)
+        found = _grep_refs(e["name"], operands)
         if found is None:
             flags.append("UNVERIFIED: reference check could not run "
                          "(no search_roots configured, or grep unavailable/timed out)")
@@ -427,7 +537,8 @@ def cmd_review(a):
 def cmd_ack(a):
     entries = _load()
     e = _find(entries, a.name)
-    refs = _grep_refs(e["name"], [e["retired_path"]])
+    refs = _grep_refs(e["name"], _grep_operands(
+        [x["retired_path"] for x in entries if x["status"] == "retired"]))
     if refs is None:
         sys.exit("reference check could not run (no search_roots configured); nothing acked")
     e["acked_refs"] = sorted(set(e.get("acked_refs", [])) | set(refs))

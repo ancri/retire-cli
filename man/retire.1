@@ -1,4 +1,4 @@
-.TH RETIRE 1 "2026-11-24" "retire 1.1.1" "User Commands"
+.TH RETIRE 1 "2026-11-24" "retire 1.2.0" "User Commands"
 .SH NAME
 retire \- set paths aside for later deletion, with a ledger and a safety review
 .SH SYNOPSIS
@@ -122,6 +122,12 @@ one review and then vanish, so hits are recorded in the ledger and re-reported a
 until
 .B rebaseline
 clears them.
+.IP
+.B review
+keeps its other reads out of the measurement too. Every tree is scanned before any
+reference check runs, and the reference check never enters a retired path. The scan
+never follows a symlink, because resolving one updates the link's own
+.IR atime .
 .TP
 .B DRIFT
 The entry count or total byte count differs from the baseline, which catches files
@@ -129,7 +135,12 @@ added to or deleted from inside the tree.
 .TP
 .B REFERENCED
 A fresh grep of the configured search roots found the retired name in a file that is
-not in the acknowledged set.
+not in the acknowledged set. Retired paths are skipped by exact path:
+.B retire
+lists the directories leading down to each one and hands grep their other children,
+filtered as
+.B grep \-r
+would filter them. A mention inside a retired tree does not count.
 .TP
 .B UNVERIFIED
 The reference check could not run at all: no search root is configured or exists, or

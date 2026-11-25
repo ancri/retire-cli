@@ -90,7 +90,7 @@ Full reference: `man retire`.
 | `TOUCHED` | Newer `atime` (reads), `mtime` (writes), or `ctime` (rename, chmod, chown) |
 | `EARLIER` | A hit from a previous review, remembered until you `rebaseline` |
 | `DRIFT` | Entry count or byte count changed — files added or deleted inside |
-| `REFERENCED` | The name still appears in your configured source roots |
+| `REFERENCED` | The name still appears in your configured source roots, outside retired paths |
 | `UNVERIFIED` | The reference check could not run — reported, never passed off as clean |
 
 An entry is `INVESTIGATE` if any of those fire, `SAFE TO PURGE` once the review date
@@ -107,6 +107,25 @@ signal answers *"has anything read this since the last review?"*, not *"since
 retirement"*. `mtime`, `ctime` and the counts are unaffected — reading a directory does
 not change them. Because that floor moves forward, hits are recorded in the ledger and
 re-reported as `EARLIER` until `rebaseline` clears them.
+
+Two more of review's own reads were reported as external ones until 1.2.0:
+
+- **The reference check.** `grep -r` over a search root lists every directory below it
+  and reads every file it includes, retired trees too, so each entry checked after the
+  first grep reported that grep as a read. Review now scans every tree before it runs
+  any reference check, and the check never enters a retired path: `retire` lists the
+  directories leading down to each retired path itself and hands grep their other
+  children. (`--exclude-dir` matches base names, so it would also skip a live directory
+  that shares a retired path's name.) A mention inside a retired tree therefore no
+  longer counts as a reference.
+- **Symlinks.** Resolving a symlink updates the link's own `atime`, and the scan used to
+  resolve every link it met (`os.walk` does, to classify entries). It now never follows
+  one.
+
+**Upgrading from 1.1.x:** hits that an earlier review made itself stay remembered as
+`EARLIER`. Their times fall inside review runs (for the weekly cron, Mondays just after
+10:00). Once an entry's remembered hits are all of that kind, clear them with
+`retire rebaseline <name>`.
 
 **It cannot tell you *who* touched something.** Timestamps carry no attribution. If you
 need that, put an audit watch on the path instead:
