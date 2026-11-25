@@ -56,7 +56,8 @@ retire 1.0.0
   notifier        notify-send
   grep            /usr/bin/grep
   search roots    none configured  [reference check reports UNVERIFIED]
-  atime slack     36 h
+  atime slack     0 h
+  default review  90d
 ```
 
 `make install` also installs the man page. If `man retire` does not resolve, add the
@@ -72,10 +73,10 @@ export MANPATH="$HOME/.local/share/man:$MANPATH"
 |---|---|
 | `retire put <path>` | Rename aside as `<path>.RETIRED.YYYYMMDD` and record it |
 | `retire adopt <path>` | Record something you already moved by hand |
-| `retire list` | Show the ledger |
-| `retire review [--notify]` | Read-only safety check |
+| `retire list [--all\|--due] [--sort K] [--full]` | Show the active pipeline (sorted by review date; `--all` for full history, `--json` for scripts) |
+| `retire review [name ...] [--due] [--notify]` | Read-only safety check (all active, `--due` only, or specific names) |
 | `retire ack <name>` | Accept the current references as known |
-| `retire rebaseline <name>` | Reset the tripwire snapshot |
+| `retire rebaseline <name>... \| --all` | Reset the tripwire snapshot (and clear remembered hits) |
 | `retire restore <name>` | Move it back |
 | `retire purge <name> --yes` | Actually delete it |
 | `retire doctor` | Report the local setup |
@@ -87,7 +88,7 @@ Full reference: `man retire`.
 
 | Signal | Catches |
 |---|---|
-| `TOUCHED` | Newer `atime` (reads), `mtime` (writes), or `ctime` (rename, chmod, chown) |
+| `TOUCHED` | Newer file `atime` (reads), or any `mtime` (writes) or `ctime` (rename, chmod, chown), with the relative path |
 | `EARLIER` | A hit from a previous review, remembered until you `rebaseline` |
 | `DRIFT` | Entry count or byte count changed — files added or deleted inside |
 | `REFERENCED` | The name still appears in your configured source roots, outside retired paths |
@@ -102,11 +103,14 @@ Walking a tree calls `readdir` on every directory, which updates that directory'
 `atime`. A naive implementation reports its own traversal as an external read on every
 run — which is exactly what `retire` 1.0.0 did.
 
-So `review` records when its walk finished and measures reads from there. The `atime`
-signal answers *"has anything read this since the last review?"*, not *"since
-retirement"*. `mtime`, `ctime` and the counts are unaffected — reading a directory does
-not change them. Because that floor moves forward, hits are recorded in the ledger and
-re-reported as `EARLIER` until `rebaseline` clears them.
+So `review` only checks `atime` on non-directories (files and symlinks), never on bare
+directory listings (`readdir`). Regular files are only inspected with `lstat`, so `review`
+never bumps their `atime` and compares them directly against the retirement baseline,
+reporting the relative path of the touched file. Directory listings from `find`, `du`,
+`rg`, desktop indexers, or `review` itself no longer trigger false `TOUCHED` alarms;
+writes, additions, deletions, renames, and permission changes inside directories are still
+caught by `mtime`, `ctime`, and `DRIFT`. Hits are recorded in the ledger and re-reported
+as `EARLIER` until `rebaseline` clears them.
 
 Two more of review's own reads were reported as external ones until 1.2.0:
 
@@ -142,7 +146,7 @@ Optional. Every key has a default. `~/.config/retire/config.json`:
 ```json
 {
   "search_roots": ["/home/me/src", "/srv/analysis"],
-  "atime_slack_hours": 36,
+  "atime_slack_hours": 0,
   "default_review_in": "6m"
 }
 ```
@@ -188,8 +192,10 @@ signal is less predictable. `mtime`, `ctime` and the count checks are unaffected
 
 - **Short names are noisy.** `REFERENCED` matches the name as a whole word, literally.
   A two-character name will match unrelated prose. Read the list once, then `ack` it.
-- **Scanners cause false positives.** Backup and indexing tools walk the tree and bump
-  `atime`. A directory listing counts as a read. This is deliberately conservative.
+- **Scanners that read file contents can still cause false positives.** Bare directory
+  listings (`find`, `du`, `ls`) are ignored, but tools that open files (backups, antivirus,
+  or search tools sniffing header bytes) still bump file `atime`. Each `TOUCHED` line
+  includes the relative path to help tell real reads from scanner noise.
 - **`noatime` mounts record no reads at all**, leaving `mtime`, `ctime` and the counts.
 - **Cross-filesystem moves are not atomic.** `put` uses `os.rename`, which fails across
   filesystems rather than silently copying 2 GB.

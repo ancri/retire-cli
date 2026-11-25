@@ -7,21 +7,37 @@ verdict and never acts on it.
 
   retire put <path> [--reason R] [--review-in 90d]   rename aside + record
   retire adopt <retired_path> [--name N] ...         record an already-moved path
-  retire list                                        show the ledger
-  retire review [--notify]                           read-only safety check
+  retire list [--all|--due] [--sort K] [--full]      show active pipeline (or full ledger)
+  retire review [name ...] [--due] [--notify]        read-only safety check
   retire ack <name>                                  accept current refs as known
-  retire rebaseline <name>                           reset the tripwire snapshot
+  retire rebaseline <name>... | --all                reset the tripwire snapshot
   retire restore <name>                              put it back
   retire purge <name> --yes                          actually delete it
   retire doctor                                      report the local setup
 
 `retire ?`, `retire help [command]` and `man retire` all show documentation.
 """
-import argparse, json, os, platform, re, shutil, stat, subprocess, sys, time
+import argparse, contextlib, fcntl, json, math, os, platform, re, shutil, stat, subprocess, sys, tempfile, time
 from datetime import date, datetime, timedelta
 from fnmatch import fnmatchcase
 
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
 __version__ = "1.2.0"
+
+
+def _fspath(p):
+    """Ensure a UTF-8 path string is passable to OS/subprocess APIs under ASCII locales."""
+    try:
+        os.fsencode(p)
+        return p
+    except UnicodeEncodeError:
+        return os.fsdecode(p.encode("utf-8"))
 
 HOME = os.path.expanduser("~")
 
@@ -36,6 +52,7 @@ STATE  = os.environ.get("RETIRE_STATE") or os.path.join(
 CONFIG = os.environ.get("RETIRE_CONFIG") or os.path.join(
     _base("XDG_CONFIG_HOME", ".config"), "retire", "config.json")
 LEDGER = os.path.join(STATE, "ledger.jsonl")
+LOCK   = os.path.join(STATE, "ledger.lock")
 LOG    = os.path.join(STATE, "review.log")
 
 DEFAULTS = {
@@ -48,23 +65,59 @@ DEFAULTS = {
                  "*.ts", "*.java", "*.rb", "*.R", "*.r", "*.sql", "*.txt"],
     "exclude_dirs": [".git", ".hg", ".svn", "__pycache__", "node_modules",
                      ".ipynb_checkpoints", ".venv", "venv", ".tox", "target"],
-    # A relatime mount only bumps atime once a day, so allow slack before calling a
-    # read real. mtime and ctime are exact and get none.
-    "atime_slack_hours": 36,
+    # Optional grace window (in hours) before a newer atime counts as a read.
+    # Default 0: file atimes are never bumped by our scan, and directory atimes are
+    # floored by their exact post-scandir timestamp. mtime and ctime are always exact.
+    "atime_slack_hours": 0,
     "default_review_in": "90d",
 }
 
 TS_FIELDS = (("atime", "read"), ("mtime", "contents modified"), ("ctime", "metadata changed"))
 
 
+def _parse_span(s):
+    m = re.fullmatch(r"(\d+)([dwmy])", s.strip().lower())
+    if not m:
+        raise argparse.ArgumentTypeError("use forms like 90d, 12w, 6m, 1y")
+    n, unit = int(m.group(1)), m.group(2)
+    return timedelta(days=n * {"d": 1, "w": 7, "m": 30, "y": 365}[unit])
+
+
+def _valid_str_list(val):
+    return isinstance(val, list) and all(isinstance(x, str) for x in val)
+
+
 def load_config():
     cfg = dict(DEFAULTS)
     try:
-        with open(CONFIG) as fh:
+        with open(CONFIG, encoding="utf-8") as fh:
             user = json.load(fh)
         if not isinstance(user, dict):
             raise ValueError("config must be a JSON object")
-        cfg.update(user)
+        for key, val in user.items():
+            if key in ("search_roots", "includes", "exclude_dirs"):
+                if not _valid_str_list(val):
+                    sys.stderr.write("retire: ignoring bad config %s in %s: expected list of strings\n"
+                                     % (key, CONFIG))
+                    continue
+            elif key == "atime_slack_hours":
+                if (isinstance(val, bool) or not isinstance(val, (int, float))
+                        or not math.isfinite(val) or val < 0):
+                    sys.stderr.write("retire: ignoring bad config %s in %s: expected non-negative number\n"
+                                     % (key, CONFIG))
+                    continue
+            elif key == "default_review_in":
+                if not isinstance(val, str):
+                    sys.stderr.write("retire: ignoring bad config %s in %s: expected duration string\n"
+                                     % (key, CONFIG))
+                    continue
+                try:
+                    _parse_span(val)
+                except argparse.ArgumentTypeError as exc:
+                    sys.stderr.write("retire: ignoring bad config %s in %s: %s\n"
+                                     % (key, CONFIG, exc))
+                    continue
+            cfg[key] = val
     except FileNotFoundError:
         pass
     except (OSError, ValueError) as exc:
@@ -80,25 +133,45 @@ CFG = load_config()
 
 # ------------------------------------------------------------------- ledger io
 
+@contextlib.contextmanager
+def _ledger_lock():
+    os.makedirs(STATE, exist_ok=True)
+    with open(LOCK, "a+") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
 def _load():
     if not os.path.exists(LEDGER):
         return []
-    with open(LEDGER) as fh:
+    with open(LEDGER, encoding="utf-8") as fh:
         return [json.loads(ln) for ln in fh if ln.strip()]
 
 
 def _save(entries):
     os.makedirs(STATE, exist_ok=True)
-    tmp = LEDGER + ".tmp"
-    with open(tmp, "w") as fh:
-        for e in entries:
-            fh.write(json.dumps(e) + "\n")
-    os.replace(tmp, LEDGER)
+    fd, tmp = tempfile.mkstemp(prefix=".ledger.", suffix=".tmp", dir=STATE)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for e in entries:
+                fh.write(json.dumps(e) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, LEDGER)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _log(msg):
     os.makedirs(STATE, exist_ok=True)
-    with open(LOG, "a") as fh:
+    with open(LOG, "a", encoding="utf-8", errors="replace") as fh:
         fh.write("%s  %s\n" % (datetime.now().isoformat(timespec="seconds"), msg))
 
 
@@ -113,56 +186,97 @@ def _fmt(ts):
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "?"
 
 
+def _fmt_size(n):
+    """Human-readable decimal byte count (matches GB elsewhere in retire)."""
+    n = max(0, int(n or 0))
+    for unit, thresh in (("T", 1e12), ("G", 1e9), ("M", 1e6), ("K", 1e3)):
+        if n >= thresh:
+            v = n / thresh
+            return "%.1f%s" % (v, unit) if v < 9.95 else "%.0f%s" % (v, unit)
+    return "%dB" % n
+
+
 # ------------------------------------------------------------------- tripwire
 
-def _tree_scan(path):
+def _tree_scan(path, with_paths=False):
     """Tripwire snapshot: newest atime/mtime/ctime, entry count, total bytes.
 
-    atime catches reads, mtime catches writes, ctime catches renames/chmod/chown, and
-    the counts catch additions or deletions inside the tree. Symlinks are stat'd with
-    lstat, never followed, and excluded from the byte total.
+    file_atime catches non-directory reads, mtime catches writes, ctime catches
+    renames/chmod/chown, and the counts catch additions or deletions inside the
+    tree. Symlinks are stat'd with lstat, never followed, and excluded from the
+    byte total. Bare directory atimes are recorded for diagnostics/compatibility
+    but do not trigger TOUCHED, since scandir and common tools (find, du, rg,
+    indexers) bump directory atimes without reading any files.
     """
-    snap = {"bytes": 0, "entries": 0, "atime": 0.0, "mtime": 0.0, "ctime": 0.0,
-            "scanned_at": 0.0}
+    snap = {"bytes": 0, "entries": 0, "atime": 0.0, "file_atime": 0.0, "dir_atime": 0.0,
+            "mtime": 0.0, "ctime": 0.0, "scanned_at": 0.0, "unreadable": 0}
+    paths = {"file_atime": "", "dir_atime": "", "atime": "", "mtime": "", "ctime": ""}
+    is_root_dir = [False]
 
-    def absorb(p):
+    def rel_label(p):
+        if not is_root_dir[0]:
+            return ""
+        rel = "." if p == path else os.path.relpath(p, path)
+        return rel.encode("utf-8", "replace").decode("utf-8")
+
+    def absorb(p, is_top=False):
         try:
             st = os.lstat(p)
         except OSError:
+            snap["unreadable"] += 1
             return None
+        if is_top:
+            is_root_dir[0] = stat.S_ISDIR(st.st_mode)
         snap["entries"] += 1
         if not stat.S_ISLNK(st.st_mode):
             snap["bytes"] += st.st_size
+        if stat.S_ISDIR(st.st_mode):
+            if st.st_atime > snap["dir_atime"]:
+                snap["dir_atime"] = st.st_atime
+                if with_paths:
+                    paths["dir_atime"] = rel_label(p)
+        else:
+            if st.st_atime > snap["file_atime"]:
+                snap["file_atime"] = st.st_atime
+                if with_paths:
+                    paths["file_atime"] = rel_label(p)
         for f, _ in TS_FIELDS:
-            snap[f] = max(snap[f], getattr(st, "st_" + f))
+            v = getattr(st, "st_" + f)
+            if v > snap[f]:
+                snap[f] = v
+                if with_paths:
+                    paths[f] = rel_label(p)
         return st
 
     # Never follow a symlink: resolving one updates the link's own atime, which
     # absorb() would then read back as an external read. os.walk() cannot be used
     # here, because it resolves links to classify them even with followlinks=False.
-    # Each directory is absorbed before it is listed, so the listing's own atime
-    # update is not seen either.
-    top = absorb(path)
+    # Each directory is absorbed before it is listed, and its post-listing atime is
+    # recorded via lstat (which does not modify atime) for legacy compatibility.
+    top = absorb(path, is_top=True)
     stack = [path] if top is not None and stat.S_ISDIR(top.st_mode) else []
+    post_dir_atime = 0.0
     while stack:
         d = stack.pop()
         try:
             with os.scandir(d) as it:
                 children = list(it)
         except OSError:
+            snap["unreadable"] += 1
             continue
+        try:
+            post_dir_atime = max(post_dir_atime, os.lstat(d).st_atime)
+        except OSError:
+            pass
         for ent in children:
             absorb(ent.path)
             try:
                 if ent.is_dir(follow_symlinks=False):
                     stack.append(ent.path)
             except OSError:
-                pass
-    # Listing a directory updates its atime. Our own scan is therefore
-    # indistinguishable from an external read unless we remember when we did it --
-    # see _drift().
-    snap["scanned_at"] = time.time()
-    return snap
+                snap["unreadable"] += 1
+    snap["scanned_at"] = max(post_dir_atime, snap["dir_atime"])
+    return (snap, paths) if with_paths else snap
 
 
 def _baseline_of(e):
@@ -170,32 +284,56 @@ def _baseline_of(e):
     if e.get("baseline"):
         return e["baseline"]
     if "baseline_atime" in e:
-        return {"atime": e["baseline_atime"]}     # pre-snapshot entry: atime only
+        out = {"atime": e["baseline_atime"]}     # pre-snapshot entry: atime only
+        if e.get("scanned_at"):
+            out["scanned_at"] = e["scanned_at"]
+        return out
     return {}
+
+
+def _fmt_touch(label, ts, rel, ref_label, ref_ts):
+    ctx = ("%s; %s %s" % (rel, ref_label, _fmt(ref_ts))) if rel else ("%s %s" % (ref_label, _fmt(ref_ts)))
+    return "TOUCHED: %s at %s (%s)" % (label, _fmt(ts), ctx)
 
 
 def _drift(e, path):
     """(flags, snapshot) describing how the tree changed since its baseline.
 
-    The atime floor is the later of the recorded baseline and the end of our own
-    previous walk, because that walk bumped every directory's atime itself. Without
-    this, review reports its own traversal as an external read.
+    Only non-directory atimes (files and symlinks) trigger TOUCHED: read, because
+    lstat() never bumps them while directory listings (readdir) are constantly
+    triggered by find/du/rg, desktop indexers, and our own scan. Writes, renames,
+    and additions/deletions inside directories are still caught by mtime, ctime,
+    and entry/byte counts.
     """
-    base, now, out = _baseline_of(e), _tree_scan(path), []
+    base = _baseline_of(e)
+    now, paths = _tree_scan(path, with_paths=True)
+    out = []
     slack_s = float(CFG["atime_slack_hours"]) * 3600
-    for f, label in TS_FIELDS:
+
+    if "file_atime" in base or "dir_atime" in base:
+        bf = base.get("file_atime")
+        if bf is not None and now["file_atime"] > bf + slack_s:
+            out.append(_fmt_touch("read", now["file_atime"], paths["file_atime"],
+                                  "baseline", bf))
+    else:
+        b = max(base.get("atime") or 0, base.get("scanned_at") or 0)
+        if b and now["file_atime"] > b + slack_s:
+            out.append(_fmt_touch("read", now["file_atime"], paths["file_atime"],
+                                  "last checked", b))
+
+    for f, label in TS_FIELDS[1:]:
         b = base.get(f)
-        if f == "atime":
-            b = max(b or 0, base.get("scanned_at") or 0)
-        if not b:
+        if b is None:
             continue
-        slack = slack_s if f == "atime" else 0
-        if now[f] > b + slack:
-            out.append("TOUCHED: %s at %s (last checked %s)" % (label, _fmt(now[f]), _fmt(b)))
+        if now[f] > b:
+            out.append(_fmt_touch(label, now[f], paths[f], "baseline", b))
     for f, label in (("entries", "entry count"), ("bytes", "total bytes")):
         b = base.get(f)
         if b is not None and now[f] != b:
             out.append("DRIFT: %s %s -> %s" % (label, b, now[f]))
+    if now.get("unreadable"):
+        out.append("UNVERIFIED: could not scan %d unreadable path(s) inside retired tree"
+                   % now["unreadable"])
     if not base:
         out.append("NO BASELINE (entry predates snapshots; run: retire rebaseline %s)" % e["name"])
     return out, now
@@ -203,18 +341,14 @@ def _drift(e, path):
 
 # -------------------------------------------------------------- reference scan
 
-def _existing_roots():
-    return [r for r in CFG["search_roots"] if os.path.isdir(r)]
-
-
 def _real(p):
     """p with the symlinks in its parent resolved, but not p itself."""
-    p = os.path.abspath(p)
+    p = os.path.abspath(_fspath(p))
     return os.path.join(os.path.realpath(os.path.dirname(p)), os.path.basename(p))
 
 
 def _grep_operands(skip_paths):
-    """Paths for grep that cover every search root except skip_paths, or None if no root exists.
+    """(operands, issues) covering every search root except skip_paths.
 
     grep must not enter a retired path: listing its directories and reading its files
     updates their atimes, which review then reports as reads. grep's --exclude-dir
@@ -223,10 +357,21 @@ def _grep_operands(skip_paths):
     are listed here and their other children are handed to grep one by one, filtered
     as grep -r filters what it finds: symlinks are not followed, exclude_dirs are
     skipped and files must match includes. Nothing inside a skipped path is opened.
+    Any missing root or unreadable directory is recorded in `issues` so the caller
+    reports UNVERIFIED instead of silently treating a failed scan as clean.
     """
-    roots = _existing_roots()
+    configured = CFG["search_roots"]
+    if not configured:
+        return None, ["no search_roots configured"]
+    roots, issues = [], []
+    for r in configured:
+        fr = _fspath(r)
+        if os.path.isdir(fr):
+            roots.append(fr)
+        else:
+            issues.append("missing search root: %s" % r)
     if not roots:
-        return None
+        return None, issues
     skip = set(_real(p) for p in skip_paths)
     above = set()                       # real directories that hold a skipped path
     for p in skip:
@@ -244,7 +389,8 @@ def _grep_operands(skip_paths):
         try:
             with os.scandir(shown) as it:
                 children = list(it)
-        except OSError:
+        except OSError as exc:
+            issues.append("cannot read %s: %s" % (shown, exc.strerror or exc))
             return
         for ent in children:
             child = os.path.join(real, ent.name)
@@ -261,7 +407,8 @@ def _grep_operands(skip_paths):
                 elif ent.is_file(follow_symlinks=False):
                     if not CFG["includes"] or matches(ent.name, CFG["includes"]):
                         ops.append(ent.path)
-            except OSError:
+            except OSError as exc:
+                issues.append("cannot inspect %s: %s" % (ent.path, exc.strerror or exc))
                 continue
 
     for root in roots:
@@ -272,7 +419,7 @@ def _grep_operands(skip_paths):
             expand(root, real)
         else:
             ops.append(root)
-    return ops
+    return ops, issues
 
 
 def _batches(paths, limit=64 * 1024):
@@ -289,29 +436,159 @@ def _batches(paths, limit=64 * 1024):
         yield batch
 
 
-def _grep_refs(name, operands):
-    """Files still mentioning `name`, or None if the check could not be run.
+def _add_issue(issues, msg):
+    if msg not in issues:
+        issues.append(msg)
 
-    `operands` comes from _grep_operands(). Advisory only -- prose mentions count too.
+
+def _grep_refs(name, operands_result):
+    """(hits, issues) for files still mentioning `name`.
+
+    `operands_result` comes from _grep_operands(). Advisory only -- prose mentions
+    count too. `issues` is non-empty whenever the check could not complete cleanly.
     """
+    operands, op_issues = operands_result
+    issues = list(op_issues)
     if operands is None:
-        return None          # no search root: grep with no path operands reads stdin
+        return [], issues    # no search root: grep with no path operands reads stdin
     cmd = ["grep", "-rlFw", "--binary-files=without-match"]
     for inc in CFG["includes"]:
         cmd.append("--include=" + inc)
     for ex in CFG["exclude_dirs"]:
         cmd.append("--exclude-dir=" + ex)
-    cmd += ["-e", name, "--"]
-    hits, deadline = [], time.time() + 180
+    cmd += ["-e", _fspath(name), "--"]
+    hits, seen, deadline = [], set(), time.time() + 180
     for batch in _batches(operands):
+        rem = deadline - time.time()
+        if rem <= 0:
+            _add_issue(issues, "grep timed out")
+            break
         try:
-            out = subprocess.run(cmd + batch, capture_output=True, text=True,
-                                 stdin=subprocess.DEVNULL,
-                                 timeout=max(1.0, deadline - time.time())).stdout
-        except (subprocess.TimeoutExpired, OSError):
-            return None
-        hits += [ln for ln in out.splitlines() if ln.strip()]
-    return hits
+            proc = subprocess.run(cmd + batch, capture_output=True,
+                                  stdin=subprocess.DEVNULL, timeout=rem)
+        except subprocess.TimeoutExpired:
+            _add_issue(issues, "grep timed out")
+            break
+        except OSError as exc:
+            _add_issue(issues, "grep unavailable: %s" % (exc.strerror or exc))
+            break
+        for raw_ln in proc.stdout.splitlines():
+            s = raw_ln.rstrip(b"\r\n").decode("utf-8", "replace")
+            if s and s not in seen:
+                seen.add(s)
+                hits.append(s)
+        if proc.returncode not in (0, 1):
+            err_text = (proc.stderr or b"").decode("utf-8", "replace").strip()
+            err_lines = err_text.splitlines()
+            detail = err_lines[0] if err_lines else ("exit status %d" % proc.returncode)
+            _add_issue(issues, "grep failed (%s)" % detail)
+    return hits, issues
+
+
+def _grep_refs_many(names, operands_result):
+    """(refs_by_name, issues) for files still mentioning each name in `names`.
+
+    Runs one recursive grep across all names to find candidate files, then attributes
+    only those candidate files back to individual names. Avoids walking search_roots
+    once per active entry when several entries are retired.
+    """
+    operands, op_issues = operands_result
+    issues = list(op_issues)
+    unique = list(dict.fromkeys(names))
+    if not unique:
+        return {}, issues
+    if operands is None:
+        return {n: [] for n in unique}, issues
+    if len(unique) == 1:
+        hits, single_issues = _grep_refs(unique[0], operands_result)
+        return {unique[0]: hits}, single_issues
+
+    # Stage 1: one recursive pass per pattern batch to find files mentioning ANY name.
+    # Capture stdout as raw bytes and round-trip paths via os.fsdecode so non-UTF-8
+    # filenames still open cleanly in Stage 2 before decoding display strings with replace.
+    base_cmd = ["grep", "-rlFw", "--binary-files=without-match"]
+    for inc in CFG["includes"]:
+        base_cmd.append("--include=" + inc)
+    for ex in CFG["exclude_dirs"]:
+        base_cmd.append("--exclude-dir=" + ex)
+
+    candidates, seen = [], set()
+    deadline = time.time() + 180
+    aborted = False
+    for name_batch in _batches(unique, limit=16 * 1024):
+        pat_args = []
+        for n in name_batch:
+            pat_args += ["-e", _fspath(n)]
+        cmd = base_cmd + pat_args + ["--"]
+        for batch in _batches(operands):
+            rem = deadline - time.time()
+            if rem <= 0:
+                _add_issue(issues, "grep timed out")
+                aborted = True
+                break
+            try:
+                proc = subprocess.run(cmd + batch, capture_output=True,
+                                      stdin=subprocess.DEVNULL, timeout=rem)
+            except subprocess.TimeoutExpired:
+                _add_issue(issues, "grep timed out")
+                aborted = True
+                break
+            except OSError as exc:
+                _add_issue(issues, "grep unavailable: %s" % (exc.strerror or exc))
+                aborted = True
+                break
+            for raw_ln in proc.stdout.splitlines():
+                raw_path = raw_ln.rstrip(b"\r\n")
+                if raw_path and raw_path not in seen:
+                    seen.add(raw_path)
+                    candidates.append(os.fsdecode(raw_path))
+            if proc.returncode not in (0, 1):
+                err_text = (proc.stderr or b"").decode("utf-8", "replace").strip()
+                err_lines = err_text.splitlines()
+                detail = err_lines[0] if err_lines else ("exit status %d" % proc.returncode)
+                _add_issue(issues, "grep failed (%s)" % detail)
+        if aborted:
+            break
+
+    result = {n: [] for n in unique}
+    if not candidates or aborted:
+        return result, issues
+
+    # Stage 2: attribute only the matching candidate files to each name (no -r walk).
+    for n in unique:
+        cmd = ["grep", "-lFw", "--binary-files=without-match", "-e", _fspath(n), "--"]
+        hits, hit_seen = [], set()
+        for batch in _batches(candidates):
+            rem = deadline - time.time()
+            if rem <= 0:
+                _add_issue(issues, "grep timed out")
+                aborted = True
+                break
+            try:
+                proc = subprocess.run(cmd + batch, capture_output=True,
+                                      stdin=subprocess.DEVNULL, timeout=rem)
+            except subprocess.TimeoutExpired:
+                _add_issue(issues, "grep timed out")
+                aborted = True
+                break
+            except OSError as exc:
+                _add_issue(issues, "grep unavailable: %s" % (exc.strerror or exc))
+                aborted = True
+                break
+            for raw_ln in proc.stdout.splitlines():
+                s = raw_ln.rstrip(b"\r\n").decode("utf-8", "replace")
+                if s and s not in hit_seen:
+                    hit_seen.add(s)
+                    hits.append(s)
+            if proc.returncode not in (0, 1):
+                err_text = (proc.stderr or b"").decode("utf-8", "replace").strip()
+                err_lines = err_text.splitlines()
+                detail = err_lines[0] if err_lines else ("exit status %d" % proc.returncode)
+                _add_issue(issues, "grep failed (%s)" % detail)
+        result[n] = hits
+        if aborted:
+            break
+    return result, issues
 
 
 # -------------------------------------------------------------- notification
@@ -319,13 +596,16 @@ def _grep_refs(name, operands):
 def _notify_darwin(title, body):
     flat = " / ".join(ln.strip() for ln in body.splitlines() if ln.strip())
     if shutil.which("terminal-notifier"):
-        subprocess.run(["terminal-notifier", "-title", title, "-message", flat], timeout=20)
+        msg = (" " + flat) if flat.startswith("-") else flat
+        subprocess.run(["terminal-notifier", "-title", title, "-message", msg],
+                       timeout=20, check=True, capture_output=True, text=True)
         return True
     if shutil.which("osascript"):
         def esc(s):
             return s.replace("\\", "\\\\").replace('"', '\\"')
         subprocess.run(["osascript", "-e", 'display notification "%s" with title "%s"'
-                        % (esc(flat), esc(title))], timeout=20)
+                        % (esc(flat), esc(title))],
+                       timeout=20, check=True, capture_output=True, text=True)
         return True
     return False
 
@@ -339,8 +619,8 @@ def _notify_linux(title, body, urgency):
     if hasattr(os, "getuid"):
         env.setdefault("DBUS_SESSION_BUS_ADDRESS",
                        "unix:path=/run/user/%d/bus" % os.getuid())
-    subprocess.run(["notify-send", "-u", urgency, "-a", "retire", title, body],
-                   env=env, timeout=20)
+    subprocess.run(["notify-send", "-u", urgency, "-a", "retire", "--", title, body],
+                   env=env, timeout=20, check=True, capture_output=True, text=True)
     return True
 
 
@@ -353,7 +633,11 @@ def notify(title, body, urgency="normal"):
             ok = _notify_linux(title, body, urgency)
         else:
             ok = False
-    except Exception as exc:                     # a desktop may simply not be up
+    except subprocess.CalledProcessError as exc:   # a desktop may simply not be up
+        detail = (exc.stderr or exc.stdout or "").strip() or str(exc)
+        _log("notification failed: %s" % detail)
+        return False
+    except Exception as exc:
         _log("notification failed: %s" % exc)
         return False
     if not ok:
@@ -363,12 +647,37 @@ def notify(title, body, urgency="normal"):
 
 # ---------------------------------------------------------------- ledger verbs
 
-def _parse_span(s):
-    m = re.fullmatch(r"(\d+)([dwmy])", s.strip().lower())
-    if not m:
-        raise argparse.ArgumentTypeError("use forms like 90d, 12w, 6m, 1y")
-    n, unit = int(m.group(1)), m.group(2)
-    return timedelta(days=n * {"d": 1, "w": 7, "m": 30, "y": 365}[unit])
+def _resolve_target(raw, verb):
+    if not raw or "\0" in raw:
+        sys.exit("invalid path: %r" % raw)
+    stripped = raw.rstrip(os.sep)
+    if not stripped:
+        sys.exit("refusing to %s filesystem root: %s" % (verb, raw))
+    path = os.path.abspath(stripped)
+    if path == os.sep:
+        sys.exit("refusing to %s filesystem root: %s" % (verb, raw))
+    return path
+
+
+def _validate_name(name):
+    bad_chars = (os.sep, "\0", "\n", "\r") + ((os.altsep,) if os.altsep else ())
+    if not name or name in (".", "..") or any(c in name for c in bad_chars):
+        sys.exit("invalid entry name: %r (must be a single non-empty filename component)" % name)
+    return name
+
+
+def _contains_state(path):
+    """True if moving `path` would relocate or break retire's own STATE directory."""
+    src_abs = os.path.abspath(path)
+    state_abs = os.path.abspath(STATE)
+    if state_abs == src_abs or state_abs.startswith(src_abs + os.sep):
+        return True
+    if os.path.isdir(path) and not os.path.islink(path):
+        src_real = _real(path)
+        state_real = os.path.realpath(STATE)
+        if state_real == src_real or state_real.startswith(src_real + os.sep):
+            return True
+    return False
 
 
 def _name_taken(entries, name):
@@ -376,10 +685,7 @@ def _name_taken(entries, name):
 
 
 def _record(original_path, retired_path, reason, review_in, name=None):
-    entries = _load()
-    name = name or os.path.basename(original_path)
-    if _name_taken(entries, name):
-        sys.exit("already an active ledger entry named %r" % name)
+    name = _validate_name(name if name is not None else os.path.basename(original_path))
     snap = _tree_scan(retired_path)
     entry = {
         "name": name,
@@ -393,22 +699,29 @@ def _record(original_path, retired_path, reason, review_in, name=None):
         "acked_refs": [],
         "status": "retired",
     }
-    entries.append(entry)
-    _save(entries)
+    with _ledger_lock():
+        entries = _load()
+        if _name_taken(entries, name):
+            sys.exit("already an active ledger entry named %r" % name)
+        entries.append(entry)
+        _save(entries)
     return entry
 
 
 def cmd_put(a):
-    src = os.path.abspath(a.path.rstrip(os.sep))
-    if not os.path.exists(src):
+    src = _resolve_target(a.path, "retire")
+    if not os.path.lexists(src):
         sys.exit("no such path: %s" % src)
+    if _contains_state(src):
+        sys.exit("refusing to retire path containing retire state directory (%s): %s"
+                 % (STATE, src))
+    name = _validate_name(os.path.basename(src))
     # Entries are named after the basename. Refuse a taken name before anything moves:
     # checking only inside _record, after the rename, left the path renamed but unrecorded.
-    if _name_taken(_load(), os.path.basename(src)):
-        sys.exit("already an active ledger entry named %r; nothing was moved"
-                 % os.path.basename(src))
+    if _name_taken(_load(), name):
+        sys.exit("already an active ledger entry named %r; nothing was moved" % name)
     dst = "%s.RETIRED.%s" % (src, date.today().strftime("%Y%m%d"))
-    if os.path.exists(dst):
+    if os.path.lexists(dst):
         sys.exit("target already exists: %s" % dst)
     try:
         os.rename(src, dst)                      # same fs -> atomic, no copy
@@ -418,7 +731,11 @@ def cmd_put(a):
         e = _record(src, dst, a.reason, a.review_in)
     except BaseException as exc:
         # Any failure to record (ledger unwritable, a racing put, Ctrl-C during the scan)
-        # must not leave a rename the ledger does not know about: move it back first.
+        # must not leave a rename the ledger does not know about: move it back first,
+        # without clobbering anything recreated at src in the meantime.
+        if os.path.lexists(src):
+            sys.exit("could not record %s (%s) and %s is now occupied; retired copy is at %s"
+                     % (src, exc, src, dst))
         try:
             os.rename(dst, src)
         except OSError as back:
@@ -432,99 +749,280 @@ def cmd_put(a):
 
 
 def cmd_adopt(a):
-    dst = os.path.abspath(a.retired_path.rstrip(os.sep))
-    if not os.path.exists(dst):
+    dst = _resolve_target(a.retired_path, "adopt")
+    if not os.path.lexists(dst):
         sys.exit("no such path: %s" % dst)
-    name = a.name or re.sub(r"\.RETIRED\.\d{8}$", "", os.path.basename(dst))
+    raw_name = a.name if a.name is not None else re.sub(r"\.RETIRED\.\d{8}$", "", os.path.basename(dst))
+    name = _validate_name(raw_name)
     original = os.path.join(os.path.dirname(dst), name)
     e = _record(original, dst, a.reason, a.review_in, name=name)
     print("adopted %s as %r (%.1f GB, review after %s)"
           % (dst, name, e["bytes"] / 1e9, e["review_after"]))
 
 
+def _sort_entries(items, key_name):
+    if key_name == "size":
+        return sorted(items, key=lambda e: (-(e.get("bytes") or 0), e["name"]))
+    if key_name == "retired":
+        return sorted(items, key=lambda e: (e.get("retired_on", ""), e["name"]))
+    if key_name == "name":
+        return sorted(items, key=lambda e: (e["name"].lower(), e["name"]))
+    return sorted(items, key=lambda e: (e.get("review_after", ""), e.get("retired_on", ""), e["name"]))
+
+
 def cmd_list(a):
     entries = _load()
     if not entries:
-        print("ledger is empty")
+        print("[]" if a.json else "ledger is empty")
         return
-    print("%-22s %-10s %-12s %-12s %8s  %s"
-          % ("NAME", "STATUS", "RETIRED", "REVIEW", "SIZE", "REASON"))
-    for e in entries:
-        print("%-22s %-10s %-12s %-12s %7.1fG  %s"
-              % (e["name"], e["status"], e["retired_on"], e["review_after"],
-                 e["bytes"] / 1e9, e["reason"]))
+
+    today = date.today().isoformat()
+    active = [e for e in entries if e["status"] == "retired"]
+    historical = len(entries) - len(active)
+
+    if a.all:
+        rows = list(entries)
+    elif a.due:
+        rows = [e for e in active if today >= e["review_after"]]
+    else:
+        rows = list(active)
+
+    if not rows:
+        if a.json:
+            print("[]")
+        elif a.due:
+            print("nothing due for review (%d active holding)" % len(active)
+                  if active else "nothing retired")
+        else:
+            print("nothing retired (%d historical; use --all to show)" % historical)
+        return
+
+    if a.all:
+        act = _sort_entries([e for e in rows if e["status"] == "retired"], a.sort)
+        hist = [e for e in rows if e["status"] != "retired"]
+        if a.sort == "review":
+            hist.sort(key=lambda e: (
+                e.get("purged_on") or e.get("restored_on") or e.get("retired_on", ""),
+                e["name"],
+            ), reverse=True)
+        else:
+            hist = _sort_entries(hist, a.sort)
+        rows = act + hist
+    else:
+        rows = _sort_entries(rows, a.sort)
+
+    if a.json:
+        print(json.dumps(rows, indent=2))
+        return
+
+    show_hits = any(e.get("events") for e in rows)
+    table = []
+    for e in rows:
+        if e["status"] == "retired":
+            st = "DUE" if today >= e["review_after"] else "holding"
+        else:
+            st = e["status"]
+        hits = str(len(e["events"])) if e.get("events") else "-"
+        reason = " ".join((e.get("reason") or "").split())
+        table.append((e["name"], st, hits, e.get("retired_on", "?"),
+                      e.get("review_after", "?"), _fmt_size(e.get("bytes")),
+                      reason, e))
+
+    w_name = max(4, max(len(r[0]) for r in table))
+    w_stat = max(6, max(len(r[1]) for r in table))
+    w_hits = max(4, max(len(r[2]) for r in table))
+    w_size = max(4, max(len(r[5]) for r in table))
+
+    if show_hits:
+        fmt = "%%-%ds  %%-%ds  %%%ds  %%-10s  %%-10s  %%%ds  %%s" % (w_name, w_stat, w_hits, w_size)
+        prefix_w = w_name + 2 + w_stat + 2 + w_hits + 2 + 10 + 2 + 10 + 2 + w_size + 2
+        print((fmt % ("NAME", "STATUS", "HITS", "RETIRED", "REVIEW", "SIZE", "REASON")).rstrip())
+    else:
+        fmt = "%%-%ds  %%-%ds  %%-10s  %%-10s  %%%ds  %%s" % (w_name, w_stat, w_size)
+        prefix_w = w_name + 2 + w_stat + 2 + 10 + 2 + 10 + 2 + w_size + 2
+        print((fmt % ("NAME", "STATUS", "RETIRED", "REVIEW", "SIZE", "REASON")).rstrip())
+
+    truncate = not a.full and (sys.stdout.isatty() or "COLUMNS" in os.environ)
+    max_reason = None
+    if truncate:
+        cols = shutil.get_terminal_size((100, 24)).columns
+        max_reason = max(16, cols - prefix_w)
+
+    for name, st, hits, ret, rev, sz, reason, e in table:
+        if max_reason is not None and len(reason) > max_reason:
+            reason = reason[:max_reason - 3].rstrip() + "..."
+        if show_hits:
+            line = fmt % (name, st, hits, ret, rev, sz, reason)
+        else:
+            line = fmt % (name, st, ret, rev, sz, reason)
+        print(line.rstrip())
+        if a.full:
+            if e["status"] == "retired":
+                print("    path: %s" % e["retired_path"])
+            else:
+                done = e.get("purged_on") or e.get("restored_on") or "?"
+                print("    path: %s (%s on %s)" % (e["original_path"], e["status"], done))
+            for x in e.get("events") or []:
+                print("    hit (%s): %s" % (x.get("seen", "?"), x.get("flag", "")))
+
+    if sys.stdout.isatty():
+        due_n = sum(1 for e in active if today >= e["review_after"])
+        act_sz = _fmt_size(sum(e.get("bytes") or 0 for e in active))
+        if a.all:
+            print("\n%d active (%d due, %s), %d historical"
+                  % (len(active), due_n, act_sz, historical))
+        elif a.due:
+            due_sz = _fmt_size(sum(e.get("bytes") or 0 for e in rows))
+            print("\n%d due (%s); %d holding" % (len(rows), due_sz, len(active) - len(rows)))
+        else:
+            tail = "; %d historical hidden (--all to show)" % historical if historical else ""
+            print("\n%d active (%d due, %s)%s" % (len(active), due_n, act_sz, tail))
+
+
+def _commit_review_updates(updates):
+    """Merge review bookkeeping updates into the ledger under lock."""
+    with _ledger_lock():
+        fresh = _load()
+        for fe in fresh:
+            if fe["status"] != "retired":
+                continue
+            key = (fe["name"], fe["retired_path"])
+            if key not in updates:
+                continue
+            orig_base, new_scanned_at, new_events = updates[key]
+            cur_base = _baseline_of(fe)
+            rebaselined = (
+                cur_base.get("mtime") != orig_base.get("mtime")
+                or cur_base.get("ctime") != orig_base.get("ctime")
+                or cur_base.get("entries") != orig_base.get("entries")
+                or cur_base.get("bytes") != orig_base.get("bytes")
+                or cur_base.get("file_atime") != orig_base.get("file_atime")
+                or (cur_base.get("scanned_at") or 0) > (orig_base.get("scanned_at") or 0)
+            )
+            if rebaselined:
+                continue
+            if new_events:
+                rem = fe.setdefault("events", [])
+                known = set(x["flag"] for x in rem)
+                for ev in new_events:
+                    if ev["flag"] not in known:
+                        rem.append(ev)
+                        known.add(ev["flag"])
+            if new_scanned_at is not None:
+                if isinstance(fe.get("baseline"), dict):
+                    fe["baseline"]["scanned_at"] = max(
+                        fe["baseline"].get("scanned_at") or 0, new_scanned_at)
+                elif "baseline_atime" in fe:
+                    fe["scanned_at"] = max(fe.get("scanned_at") or 0, new_scanned_at)
+        _save(fresh)
 
 
 def cmd_review(a):
+    if a.due and a.names:
+        sys.exit("cannot combine --due with explicit entry names")
     entries = _load()
     active = [e for e in entries if e["status"] == "retired"]
-    if not active:
+    if not active and not a.names:
         print("nothing retired")
-        return
+        return 0
     today, alerts = date.today(), []
 
-    # Scan every tree before running any reference check. grep reads directories and
-    # files under the search roots, so a tree scanned after a grep could see that grep
-    # as a read; _grep_operands() also keeps grep out of every retired path. lexists,
-    # because exists() would resolve a retired symlink and update its atime.
-    scans = []
-    for e in active:
-        if os.path.lexists(e["retired_path"]):
-            scans.append(_drift(e, e["retired_path"]))
-        else:
-            scans.append((["MISSING (moved or deleted outside this tool)"], None))
-    operands = _grep_operands([e["retired_path"] for e in active])
+    if a.names:
+        targets, seen = [], set()
+        for name in a.names:
+            e = _find(entries, name)
+            if e["name"] not in seen:
+                seen.add(e["name"])
+                targets.append(e)
+    elif a.due:
+        targets = [e for e in active if today.isoformat() >= e["review_after"]]
+        if not targets:
+            print("nothing due for review")
+            return 0
+    else:
+        targets = active
 
-    for e, (tripped, snap) in zip(active, scans):
-        flags = list(tripped)
-        found = _grep_refs(e["name"], operands)
-        if found is None:
-            flags.append("UNVERIFIED: reference check could not run "
-                         "(no search_roots configured, or grep unavailable/timed out)")
-        else:
+    # Scan every targeted tree before running any reference check. grep reads directories
+    # and files under the search roots, so a tree scanned after a grep could see that grep
+    # as a read; _grep_operands() also keeps grep out of every active retired path (even
+    # untargeted ones). lexists, because exists() would resolve a retired symlink and
+    # update its atime. Persist scanned_at even if interrupted mid-run so an aborted scan
+    # never poisons the next review.
+    scans, updates, committed = [], {}, False
+    try:
+        for e in targets:
+            rpath = _fspath(e["retired_path"])
+            if os.path.lexists(rpath):
+                tripped, snap = _drift(e, rpath)
+            else:
+                tripped, snap = ["MISSING (moved or deleted outside this tool)"], None
+            scans.append((tripped, snap))
+            updates[(e["name"], e["retired_path"])] = (
+                dict(_baseline_of(e)),
+                snap["scanned_at"] if snap is not None else None,
+                [],
+            )
+        operands = _grep_operands([e["retired_path"] for e in active])
+        refs_by_name, ref_issues = _grep_refs_many([e["name"] for e in targets], operands)
+
+        for e, (tripped, snap) in zip(targets, scans):
+            flags = list(tripped)
+            found = refs_by_name.get(e["name"], [])
             refs = [r for r in found if r not in set(e.get("acked_refs", []))]
             if refs:
                 flags.append("REFERENCED in %d new file(s): %s"
                              % (len(refs), ", ".join(refs[:3]) + (" ..." if len(refs) > 3 else "")))
-        due = today.isoformat() >= e["review_after"]
-        if due:
-            flags.append("DUE (review date %s passed)" % e["review_after"])
+            if ref_issues:
+                flags.append("UNVERIFIED: reference check could not complete (%s)"
+                             % "; ".join(ref_issues))
+            due = today.isoformat() >= e["review_after"]
+            if due:
+                flags.append("DUE (review date %s passed)" % e["review_after"])
 
-        # A tripwire hit is recorded, because rolling the atime floor forward (below)
-        # would otherwise make a real touch visible in exactly one review and then
-        # vanish. Cleared by rebaseline.
-        remembered = e.setdefault("events", [])
-        known = set(x["flag"] for x in remembered)
-        for f in flags:
-            if f.startswith(("TOUCHED", "DRIFT")) and f not in known:
-                remembered.append({"seen": today.isoformat(), "flag": f})
-                known.add(f)
-        earlier = [x for x in remembered if x["flag"] not in flags]
+            remembered = list(e.get("events", []))
+            known = set(x["flag"] for x in remembered)
+            new_events = []
+            for f in flags:
+                if f.startswith(("TOUCHED", "DRIFT")) and f not in known:
+                    ev = {"seen": today.isoformat(), "flag": f}
+                    remembered.append(ev)
+                    new_events.append(ev)
+                    known.add(f)
+            earlier = [x for x in remembered if x["flag"] not in flags]
 
-        # Our own walk bumped every directory's atime; move the floor past it so the
-        # next review measures reads since this check, not since retirement.
-        if snap is not None and isinstance(e.get("baseline"), dict):
-            e["baseline"]["scanned_at"] = snap["scanned_at"]
+            updates[(e["name"], e["retired_path"])] = (
+                dict(_baseline_of(e)),
+                snap["scanned_at"] if snap is not None else None,
+                new_events,
+            )
 
-        serious = ("TOUCHED", "DRIFT", "REFERENCED", "MISSING", "NO BASELINE", "UNVERIFIED")
-        if any(f.startswith(serious) for f in flags) or earlier:
-            verdict = "INVESTIGATE"
-        elif due:
-            verdict = "SAFE TO PURGE"
-        else:
-            verdict = "holding"
+            serious = ("TOUCHED", "DRIFT", "REFERENCED", "MISSING", "NO BASELINE", "UNVERIFIED")
+            if any(f.startswith(serious) for f in flags) or earlier:
+                verdict = "INVESTIGATE"
+            elif due:
+                verdict = "SAFE TO PURGE"
+            else:
+                verdict = "holding"
 
-        line = "%s [%s] %.1f GB" % (e["name"], verdict, e["bytes"] / 1e9)
-        print(line)
-        for f in flags:
-            print("    - %s" % f)
-        for x in earlier:
-            print("    - EARLIER (%s): %s" % (x["seen"], x["flag"]))
-        _log(line + ("; " + "; ".join(flags) if flags else ""))
-        if verdict != "holding":
-            alerts.append((e, verdict))
+            line = "%s [%s] %.1f GB" % (e["name"], verdict, e["bytes"] / 1e9)
+            print(line)
+            for f in flags:
+                print("    - %s" % f)
+            for x in earlier:
+                print("    - EARLIER (%s): %s" % (x["seen"], x["flag"]))
+            _log(line + ("; " + "; ".join(flags) if flags else ""))
+            if verdict != "holding":
+                alerts.append((e, verdict))
 
-    _save(entries)          # bookkeeping only: atime floor + remembered hits
+        _commit_review_updates(updates)
+        committed = True
+    except BaseException:
+        if updates and not committed:
+            try:
+                _commit_review_updates(updates)
+            except OSError:
+                pass
+        raise
 
     if a.notify and alerts:
         body = "\n".join("%s: %s" % (e["name"], v) for e, v in alerts)
@@ -537,62 +1035,162 @@ def cmd_review(a):
 def cmd_ack(a):
     entries = _load()
     e = _find(entries, a.name)
-    refs = _grep_refs(e["name"], _grep_operands(
+    refs, issues = _grep_refs(e["name"], _grep_operands(
         [x["retired_path"] for x in entries if x["status"] == "retired"]))
-    if refs is None:
-        sys.exit("reference check could not run (no search_roots configured); nothing acked")
-    e["acked_refs"] = sorted(set(e.get("acked_refs", [])) | set(refs))
-    _save(entries)
+    if issues:
+        sys.exit("reference check could not complete (%s); nothing acked" % "; ".join(issues))
+    with _ledger_lock():
+        entries = _load()
+        e = _find(entries, a.name)
+        e["acked_refs"] = sorted(set(e.get("acked_refs", [])) | set(refs))
+        _save(entries)
+        acked = list(e["acked_refs"])
     print("acknowledged %d reference(s) for %r:" % (len(refs), a.name))
-    for r in e["acked_refs"]:
+    for r in acked:
         print("    %s" % r)
     print("review will now flag only references that appear after this point.")
 
 
 def cmd_rebaseline(a):
+    if a.all and a.names:
+        sys.exit("cannot combine --all with explicit entry names")
+    if not a.all and not a.names:
+        sys.exit("specify one or more entry names, or --all")
     entries = _load()
-    e = _find(entries, a.name)
-    old = _baseline_of(e)
-    e["baseline"] = _tree_scan(e["retired_path"])
-    e["bytes"] = e["baseline"]["bytes"]
-    e.pop("baseline_atime", None)
-    cleared = len(e.get("events", []))
-    e["events"] = []
-    _save(entries)
-    print("rebaselined %r%s" % (a.name, " (cleared %d remembered hit(s))" % cleared if cleared else ""))
-    for f, _ in TS_FIELDS:
-        print("    %-6s %s -> %s" % (f, _fmt(old.get(f)), _fmt(e["baseline"][f])))
-    print("    %-6s %s entries, %s bytes"
-          % ("size", e["baseline"]["entries"], e["baseline"]["bytes"]))
+    if a.all:
+        targets = [e for e in entries if e["status"] == "retired"]
+        if not targets:
+            print("nothing retired")
+            return 0
+    else:
+        targets, seen = [], set()
+        for name in a.names:
+            e = _find(entries, name)
+            if e["name"] not in seen:
+                seen.add(e["name"])
+                targets.append(e)
+
+    snaps, skipped = {}, 0
+    for e in targets:
+        if not os.path.lexists(e["retired_path"]):
+            if a.all:
+                sys.stderr.write("retire: skipping missing path for %r: %s\n"
+                                 % (e["name"], e["retired_path"]))
+                skipped += 1
+                continue
+            sys.exit("retired path is missing: %s" % e["retired_path"])
+        snaps[(e["name"], e["retired_path"])] = _tree_scan(e["retired_path"])
+
+    if not snaps:
+        return 1 if skipped else 0
+
+    results = []
+    with _ledger_lock():
+        fresh = _load()
+        for e in targets:
+            key = (e["name"], e["retired_path"])
+            if key not in snaps:
+                continue
+            fe = next((x for x in fresh
+                       if x["name"] == e["name"] and x["status"] == "retired"), None)
+            if fe is None:
+                continue
+            if not os.path.lexists(fe["retired_path"]):
+                if a.all:
+                    sys.stderr.write("retire: skipping missing path for %r: %s\n"
+                                     % (fe["name"], fe["retired_path"]))
+                    skipped += 1
+                    continue
+                sys.exit("retired path is missing: %s" % fe["retired_path"])
+            snap = snaps[key]
+            old = _baseline_of(fe)
+            cleared = len(fe.get("events", []))
+            fe["baseline"] = snap
+            fe["bytes"] = snap["bytes"]
+            fe.pop("baseline_atime", None)
+            fe.pop("scanned_at", None)
+            fe["events"] = []
+            results.append((fe["name"], old, snap, cleared))
+        _save(fresh)
+
+    for name, old, snap, cleared in results:
+        print("rebaselined %r%s" % (name, " (cleared %d remembered hit(s))" % cleared if cleared else ""))
+        for f, _ in TS_FIELDS:
+            old_ts = old.get("file_atime") if f == "atime" and "file_atime" in old else old.get(f)
+            new_ts = snap["file_atime"] if f == "atime" else snap[f]
+            print("    %-6s %s -> %s" % (f, _fmt(old_ts), _fmt(new_ts)))
+        print("    %-6s %s entries, %s bytes"
+              % ("size", snap["entries"], snap["bytes"]))
+    return 1 if skipped else 0
 
 
 def cmd_restore(a):
-    entries = _load()
-    e = _find(entries, a.name)
-    if os.path.exists(e["original_path"]):
-        sys.exit("original path is occupied: %s" % e["original_path"])
-    os.rename(e["retired_path"], e["original_path"])
-    e["status"] = "restored"
-    e["restored_on"] = date.today().isoformat()
-    _save(entries)
-    print("restored %s -> %s" % (e["retired_path"], e["original_path"]))
+    try:
+        with _ledger_lock():
+            entries = _load()
+            e = _find(entries, a.name)
+            retired_path, original_path = e["retired_path"], e["original_path"]
+            if not os.path.lexists(retired_path):
+                sys.exit("retired path is missing: %s" % retired_path)
+            if retired_path == original_path:
+                sys.exit("cannot restore %r: adopted in place (original path equals retired path: %s)"
+                         % (a.name, retired_path))
+            if os.path.lexists(original_path):
+                sys.exit("original path is occupied: %s" % original_path)
+            try:
+                os.rename(retired_path, original_path)
+            except OSError as exc:
+                sys.exit("could not restore %s: %s" % (retired_path, exc))
+            try:
+                e["status"] = "restored"
+                e["restored_on"] = date.today().isoformat()
+                _save(entries)
+            except BaseException as exc:
+                if os.path.lexists(retired_path):
+                    sys.exit("could not update ledger (%s) and %s is now occupied; restored copy is at %s"
+                             % (exc, retired_path, original_path))
+                try:
+                    os.rename(original_path, retired_path)
+                except OSError as back:
+                    sys.exit("could not update ledger (%s) and could not move %s back (%s); it is at %s"
+                             % (exc, original_path, back, original_path))
+                if isinstance(exc, OSError):
+                    sys.exit("could not update ledger: %s; moved it back, nothing changed" % exc)
+                raise
+    except OSError as exc:
+        sys.exit("could not lock ledger: %s; nothing changed" % exc)
+    print("restored %s -> %s" % (retired_path, original_path))
 
 
 def cmd_purge(a):
-    entries = _load()
-    e = _find(entries, a.name)
     if not a.yes:
+        e = _find(_load(), a.name)
         sys.exit("would delete %s (%.1f GB). Re-run with --yes to confirm."
                  % (e["retired_path"], e["bytes"] / 1e9))
-    print("deleting %s (%.1f GB) ..." % (e["retired_path"], e["bytes"] / 1e9))
-    if os.path.isdir(e["retired_path"]) and not os.path.islink(e["retired_path"]):
-        shutil.rmtree(e["retired_path"])
-    else:
-        os.remove(e["retired_path"])             # put also accepts single files
-    e["status"] = "purged"
-    e["purged_on"] = date.today().isoformat()
-    _save(entries)
-    _log("PURGED %s" % e["retired_path"])
+    try:
+        with _ledger_lock():
+            entries = _load()
+            e = _find(entries, a.name)
+            retired_path = e["retired_path"]
+            if not os.path.lexists(retired_path):
+                sys.exit("retired path is missing: %s" % retired_path)
+            print("deleting %s (%.1f GB) ..." % (retired_path, e["bytes"] / 1e9))
+            try:
+                if os.path.isdir(retired_path) and not os.path.islink(retired_path):
+                    shutil.rmtree(retired_path)
+                else:
+                    os.remove(retired_path)      # put also accepts single files
+            except OSError as exc:
+                sys.exit("could not delete %s: %s" % (retired_path, exc))
+            e["status"] = "purged"
+            e["purged_on"] = date.today().isoformat()
+            try:
+                _save(entries)
+            except OSError as exc:
+                sys.exit("deleted %s, but could not update ledger: %s" % (retired_path, exc))
+    except OSError as exc:
+        sys.exit("could not lock ledger: %s; nothing deleted" % exc)
+    _log("PURGED %s" % retired_path)
     print("done")
 
 
@@ -623,11 +1221,22 @@ def cmd_doctor(a):
     if not roots:
         print("  search roots    none configured  [reference check reports UNVERIFIED]")
     for r in roots:
-        print("  search root     %s%s" % (r, "" if os.path.isdir(r) else "   [MISSING]"))
+        print("  search root     %s%s" % (r, "" if os.path.isdir(_fspath(r)) else "   [MISSING]"))
     print("  atime slack     %s h" % CFG["atime_slack_hours"])
+    print("  default review  %s" % CFG["default_review_in"])
 
 
 # ------------------------------------------------------------------------- cli
+
+def _default_review_span():
+    raw = CFG.get("default_review_in", DEFAULTS["default_review_in"])
+    try:
+        return _parse_span(str(raw))
+    except argparse.ArgumentTypeError as exc:
+        sys.stderr.write("retire: ignoring bad default_review_in %r in %s: %s\n"
+                         % (raw, CONFIG, exc))
+        return _parse_span(DEFAULTS["default_review_in"])
+
 
 def build_parser():
     ap = argparse.ArgumentParser(
@@ -637,7 +1246,7 @@ def build_parser():
     ap.add_argument("--version", action="version", version="retire " + __version__)
     sub = ap.add_subparsers(dest="cmd")
     P = {}
-    span = _parse_span(DEFAULTS["default_review_in"])
+    span = _default_review_span()
 
     p = sub.add_parser("put", help="rename a path aside and record it")
     p.add_argument("path")
@@ -652,18 +1261,38 @@ def build_parser():
     p.add_argument("--review-in", type=_parse_span, default=span)
     p.set_defaults(func=cmd_adopt); P["adopt"] = p
 
-    p = sub.add_parser("list", help="show the ledger")
+    p = sub.add_parser("list", help="show active pipeline (or full ledger with --all)")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("-a", "--all", action="store_true",
+                   help="include purged and restored entries")
+    g.add_argument("--due", action="store_true",
+                   help="show only active entries whose review date has passed")
+    p.add_argument("--sort", choices=("review", "retired", "size", "name"),
+                   default="review", help="sort order (default: review)")
+    p.add_argument("--full", action="store_true",
+                   help="do not truncate reasons and include paths and hits")
+    p.add_argument("--json", action="store_true",
+                   help="output matching entries as JSON")
     p.set_defaults(func=cmd_list); P["list"] = p
 
     p = sub.add_parser("review", help="read-only safety check")
-    p.add_argument("--notify", action="store_true")
+    p.add_argument("names", nargs="*", metavar="name",
+                   help="check only these active entries (default: all active)")
+    p.add_argument("--due", action="store_true",
+                   help="check only active entries whose review date has passed")
+    p.add_argument("--notify", action="store_true",
+                   help="send a desktop notification when items need attention")
     p.set_defaults(func=cmd_review); P["review"] = p
 
     p = sub.add_parser("ack", help="accept current references as known")
     p.add_argument("name"); p.set_defaults(func=cmd_ack); P["ack"] = p
 
     p = sub.add_parser("rebaseline", help="reset the tripwire snapshot")
-    p.add_argument("name"); p.set_defaults(func=cmd_rebaseline); P["rebaseline"] = p
+    p.add_argument("names", nargs="*", metavar="name",
+                   help="active entry names to rebaseline")
+    p.add_argument("--all", action="store_true",
+                   help="rebaseline all active entries")
+    p.set_defaults(func=cmd_rebaseline); P["rebaseline"] = p
 
     p = sub.add_parser("restore", help="move it back")
     p.add_argument("name"); p.set_defaults(func=cmd_restore); P["restore"] = p

@@ -55,11 +55,39 @@ suffix unless
 .B \-\-name
 is given.
 .TP
-.B list
-Print the ledger: name, status, retirement date, review date, size, reason.
+.BR list " [" \-a | \-\-all " | " \-\-due "] [" \-\-sort " " \fIkey\fR "] [" \-\-full "] [" \-\-json ]
+Show active (retired, not yet purged or restored) entries, sorted by review date
+ascending with sizes formatted in human\-readable units. Active entries whose review
+date has passed are marked
+.BR DUE ;
+others are marked
+.BR holding .
+If any displayed entry has remembered tripwire hits from an earlier
+.BR review ,
+a
+.B HITS
+column shows the count. On a terminal, reasons are truncated to fit the width unless
+.B \-\-full
+is given.
+.B \-a\fR/\fB\-\-all
+includes purged and restored entries (listed after active ones);
+.B \-\-due
+restricts output to active entries whose review date has passed;
+.B \-\-sort
+accepts
+.IR review " (default), " retired ", " size " (largest first) or " name ;
+.B \-\-full
+disables reason truncation and also prints each entry's path and remembered hits;
+.B \-\-json
+prints the matching entries as a JSON array.
 .TP
-.BR review " [" \-\-notify ]
-Read\-only safety check over every active entry. With
+.BR review " [" \fIname\fR " ...] [" \-\-due "] [" \-\-notify ]
+Read\-only safety check over active entries (or only the named entries, or with
+.B \-\-due
+only those whose review date has passed). When checking multiple entries, the reference
+scan walks the search roots once to find candidate files before attributing matches to
+individual names, and always skips every active retired path even when only a subset is
+reviewed. With
 .BR \-\-notify ,
 sends a desktop notification when, and only when, at least one entry needs attention.
 .TP
@@ -69,9 +97,13 @@ Accept the current set of references as known and expected, so that
 flags only references appearing after this point. Use it to silence historical
 mentions without losing the ability to detect new ones.
 .TP
-.BI "rebaseline " name
-Reset the tripwire snapshot to the tree's current state. Use after deliberately
-touching a retired path, or to upgrade an entry written by an older version.
+.BR rebaseline " " \fIname\fR " [" \fIname\fR " ...] | " \-\-all
+Reset the tripwire snapshot to each tree's current state and clear remembered hits. Use
+after deliberately touching a retired path, or to upgrade entries written by an older
+version. With
+.BR \-\-all ,
+rebaselines every active entry (skipping any whose path is missing on disk with a
+warning).
 .TP
 .BI "restore " name
 Move the path back to its original location and mark the entry restored. Refuses if
@@ -91,33 +123,42 @@ a new machine.
 reports four independent signals.
 .TP
 .B TOUCHED
-The tree's newest
-.IR atime ", " mtime " or " ctime
+A non\-directory entry's
+.I atime
+(files and symlinks), or any entry's
+.IR mtime " or " ctime ,
 is later than the recorded baseline:
 .I atime
-catches reads,
+catches file reads,
 .I mtime
 catches writes, and
 .I ctime
-catches renames, chmod and chown.
+catches renames, chmod and chown. For directory trees, the message includes the relative
+path of the entry with the newest timestamp.
 .IP
-Walking a tree calls
-.BR readdir (3)
-on every directory, which updates that directory's own
-.IR atime .
-.B review
-therefore records when its walk finished and measures reads from that point, not from
-retirement: the
+Bare directory
 .I atime
-signal answers \(lqhas anything read this since the last review?\(rq. Without that
-floor the check reports its own traversal as an external read on every run.
-.I mtime
+updates from
+.BR readdir (3)
+do not trigger
+.BR TOUCHED :
+directory listings are constantly bumped by tools like
+.BR find (1),
+.BR du (1),
+search tools, desktop indexers, and
+.BR review 's
+own walk without reading any file contents. Additions, deletions, renames and
+permission changes inside directories are still caught by
+.IR mtime ", " ctime
 and
-.I ctime
-are unaffected \(em reading a directory does not change them.
+.BR DRIFT .
+Regular files and symlinks are inspected only with
+.BR lstat (2),
+which never updates their
+.IR atime ,
+so file reads are compared directly against the original baseline.
 .IP
-Because the floor moves forward, a genuine hit would otherwise be visible in exactly
-one review and then vanish, so hits are recorded in the ledger and re-reported as
+Hits are recorded in the ledger and re\-reported as
 .B EARLIER
 until
 .B rebaseline
@@ -143,8 +184,10 @@ filtered as
 would filter them. A mention inside a retired tree does not count.
 .TP
 .B UNVERIFIED
-The reference check could not run at all: no search root is configured or exists, or
-grep is missing or timed out. Reported rather than silently passing as clean.
+A safety check could not complete cleanly: no search root is configured, one or more
+configured search roots are missing or unreadable, paths inside the retired tree could
+not be scanned, or grep failed, was missing, or timed out. Reported rather than silently
+passing as clean.
 .PP
 An entry is reported as
 .B INVESTIGATE
@@ -176,13 +219,9 @@ and
 .IR node_modules .
 .TP
 .B atime_slack_hours
-Seconds of grace before a newer
+Optional grace window before a newer
 .I atime
-counts as a read, expressed in hours. Defaults to 36, which suits a
-.B relatime
-mount where a read only updates
-.I atime
-once a day.
+counts as a read, expressed in hours. Defaults to 0 (exact comparison).
 .I mtime
 and
 .I ctime
@@ -201,7 +240,7 @@ Example:
 .EX
 {
   "search_roots": ["/home/me/src", "/srv/analysis"],
-  "atime_slack_hours": 36,
+  "atime_slack_hours": 0,
   "default_review_in": "6m"
 }
 .EE
@@ -280,9 +319,14 @@ will not record reads at all, leaving
 and the count checks as the only signals.
 .TP
 .B False positives
-Backup, indexing and antivirus scanners walk the tree and bump
+Backup, indexing, search and antivirus tools that open and read file contents (even a
+few header bytes to sniff binary vs. text) still bump file
 .IR atime .
-A directory listing counts as a read. This is deliberately conservative.
+Bare directory listings
+.RB ( readdir )
+are ignored. The relative path printed in each
+.B TOUCHED
+line helps distinguish data reads from scanner noise.
 .TP
 .B Short names are noisy
 .B REFERENCED
