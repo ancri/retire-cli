@@ -770,5 +770,13 @@ absent "Stage 2 grep error is not duplicated per name" "stage2boom); grep failed
 "$RETIRE" purge dd2 --yes >/dev/null
 "$RETIRE" purge dd3 --yes >/dev/null
 
+# --- piping to a consumer that closes early produces no BrokenPipeError ------
+("$RETIRE" list --all --json 2>"$TMP/pipe_err1.txt" | head -n 1 >/dev/null) || true
+absent "piped list --json produces no BrokenPipeError" "BrokenPipeError" "$(cat "$TMP/pipe_err1.txt")"
+absent "piped list --json produces no Traceback"       "Traceback"       "$(cat "$TMP/pipe_err1.txt")"
+("$RETIRE" list --all --full 2>"$TMP/pipe_err2.txt" | false) || true
+absent "closed-pipe list --full produces no BrokenPipeError" "BrokenPipeError" "$(cat "$TMP/pipe_err2.txt")"
+absent "closed-pipe list --full produces no Exception"       "Exception"       "$(cat "$TMP/pipe_err2.txt")"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

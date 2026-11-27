@@ -17,7 +17,7 @@ verdict and never acts on it.
 
 `retire ?`, `retire help [command]` and `man retire` all show documentation.
 """
-import argparse, contextlib, fcntl, json, math, os, platform, re, shutil, stat, subprocess, sys, tempfile, time
+import argparse, contextlib, fcntl, json, math, os, platform, re, shutil, signal, stat, subprocess, sys, tempfile, time
 from datetime import date, datetime, timedelta
 from fnmatch import fnmatchcase
 
@@ -1326,4 +1326,17 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+        sys.stdout.flush()
+        sys.exit(rc)
+    except BrokenPipeError:
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull, sys.stdout.fileno())
+            finally:
+                os.close(devnull)
+        except OSError:
+            pass
+        sys.exit(128 + getattr(signal, "SIGPIPE", 13))
